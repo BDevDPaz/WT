@@ -1,0 +1,523 @@
+Definicion del runtime adapter real como contrato de implementación concreto, alineado con todo lo anterior y mapeado directamente a los módulos que hoy ya existen en tu sistema:
+• db.ts → persistencia de sesiones, settings, audit logs y system logs. 12
+• LocationManager.ts → permisos, geocerca, salida detectada, auto check-in y stop monitoring. 3
+• Notifications.ts → permisos de notificaciones, canal Android y recordatorio diario. 3
+• ReportGenerator.ts → generación PDF, compartir y envío por correo. 3
+• logBridge.ts + logger.ts → logs estructurados, auditoría y feedback UX. 24
+Además, hice una búsqueda adicional en tu entorno para este tema y no aparecieron artefactos nuevos que cambien el modelo ya construido, así que el contrato se apoya únicamente en los archivos que ya analizamos.
+
+───
+
+Contrato formal del Runtime Adapter
+1. Objetivo del runtime adapter
+El runtime adapter es la capa de infraestructura real que ejecuta IO y efectos externos, mientras que:
+• el reducer muta estado canónico,
+• los selectors leen estado derivado,
+• y el runtime adapter conecta el engine con SQLite, Expo Location, Expo Notifications, Expo Print, MailComposer, Sharing y logging. 1324
+
+───
+
+2. Contrato raíz
+2.1 Definición formal
+ts
+interface WorkTrackerRuntimeAdapter {
+  sessionStore: SessionStoreAdapter;
+  location: LocationAdapter;
+  notifications: NotificationsAdapter;
+  reports: ReportsAdapter;
+  security: SecurityAdapter;
+  logging: LoggingAdapter;
+}
+
+2.2 Regla estructural
+Cada sub-adapter:
+• ejecuta infraestructura real,
+• no contiene lógica de negocio de UI,
+• no decide el engineState,
+• no reemplaza al reducer,
+• devuelve datos crudos o resultados de ejecución, para que el effect handler emita eventos secundarios.
+Eso es consistente con la separación que ya construimos entre reducer, effect handlers y UI, y con el hecho de que hoy la lógica está repartida entre DB, servicios y UI mock. 1356
+
+───
+
+3. sessionStore — contrato concreto de persistencia
+Este adapter reemplaza funcionalmente a db.ts, que hoy:
+• inicializa SQLite,
+• crea work_sessions, settings, audit_logs, system_logs,
+• guarda settings por defecto,
+• crea/cierra/edita/elimina sesiones,
+• valida overlap,
+• consulta la sesión abierta,
+• y calcula stats semanales. 1
+
+───
+
+3.1 Contrato formal
+ts
+interface SessionStoreAdapter {
+  initialize(): Promise<SessionStoreBootResult>;
+
+  getSettings(): Promise<AppSettingsRecord | null>;
+  saveSettings(settings: AppSettingsRecord): Promise<void>;
+
+  createSession(session: SessionRecord): Promise<{ sessionId: number }>;
+  updateSessionDestination(sessionId: number, patch: SessionDestinationPatch): Promise<void>;
+  markSessionActive(sessionId: number, actualStartAtMs: number): Promise<void>;
+  closeSession(sessionId: number, endAtMs: number, closeMode: "manual" | "auto_gps"): Promise<void>;
+  recordLunch(sessionId: number, lunch: LunchRecord): Promise<void>;
+  updateSessionManual(sessionId: number, patch: ManualSessionPatch): Promise<void>;
+  softDeleteSession(sessionId: number): Promise<void>;
+
+  getOpenSession(): Promise<SessionRecord | null>;
+  getSessionById(sessionId: number): Promise<SessionRecord | null>;
+  getSessionsInRange(startAtMs: number, endAtMs: number): Promise<SessionRecord[]>;
+  getAllSessions(): Promise<SessionRecord[]>;
+  checkOverlap(input: SessionOverlapCheckInput): Promise<boolean>;
+
+  getWeeklyStats(mondayTs: number, nowTs: number): Promise<{ totalMs: number }>;
+
+  appendAuditLog(entry: AuditLogRecord): Promise<void>;
+  appendSystemLog(entry: SystemLogRecord): Promise<void>;
+
+  getAuditLogsInRange(startAtMs: number, endAtMs: number): Promise<AuditLogRecord[]>;
+  getSystemLogsInRange(startAtMs: number, endAtMs: number): Promise<SystemLogRecord[]>;
+}
+
+
+───
+
+3.2 Responsabilidad exacta
+initialize()
+Debe:
+• abrir la DB,
+• aplicar PRAGMAs (journal_mode=WAL, synchronous=NORMAL, foreign_keys=ON),
+• crear tablas,
+• asegurar settings por defecto.
+Eso ya existe explícitamente en initDatabase() y configureDatabase(). 1
+
+───
+
+3.3 Modelo mínimo que debe soportar
+SessionRecord
+Debe cubrir exactamente los campos reales de work_sessions:
+• id
+• start_time
+• actual_start_time
+• end_time
+• status
+• latitude
+• longitude
+• target_latitude
+• target_longitude
+• setup_latitude
+• setup_longitude
+• address
+• client_name
+• location_confirmed
+• is_manual_edit
+• manual_note
+• lunch_taken
+• lunch_start
+• lunch_end
+• date_string1
+AppSettingsRecord
+Debe cubrir exactamente los campos de settings:
+• employee_name
+• employer_name
+• company_email
+• tolerance_radius
+• hourly_rate
+• language
+• start_time
+• overtime_multiplier1
+AuditLogRecord
+• session_id
+• action_type
+• details
+• timestamp12
+SystemLogRecord
+• timestamp
+• timestamp_str
+• color
+• categoria
+• severidad
+• mensaje
+• metadata12
+
+───
+
+3.4 Restricción obligatoria
+sessionStoreno debe:
+• calcular nómina,
+• derivar badges,
+• decidir engineState,
+• emitir feedback UX.
+Esas tareas pertenecen a derivaciones, reducers o logging/feedback. Hoy db.ts ya mezcla parte de la lógica de dominio con persistencia, y precisamente este adapter la aísla. 1
+
+───
+
+4. location — contrato concreto de geolocalización y geocerca
+Este adapter reemplaza a LocationManager.ts, que hoy:
+• pide permisos foreground/background,
+• inicia geocerca,
+• detecta Enter / Exit,
+• guarda LAST_GEOFENCE_EXIT_TIMESTAMP,
+• programa notificaciones,
+• y detiene geofence + location updates. 3
+
+───
+
+4.1 Contrato formal
+ts
+interface LocationAdapter {
+  requestPermissions(): Promise<{
+    foreground: "granted" | "denied" | "unknown";
+    background: "granted" | "denied" | "unknown";
+  }>;
+
+  startMonitoringArrival(input: {
+    latitude: number;
+    longitude: number;
+    radiusMeters: number;
+    taskName: string;
+  }): Promise<{ success: boolean }>;
+
+  stopMonitoring(taskName: string): Promise<void>;
+
+  getCurrentPositionWarmup(): Promise<void>;
+
+  saveLastExitTimestamp(timestampMs: number): Promise<void>;
+  getLastExitTimestamp(): Promise<number | null>;
+  clearLastExitTimestamp(): Promise<void>;
+}
+
+
+───
+
+4.2 Responsabilidad exacta
+requestPermissions()
+Debe reflejar exactamente el comportamiento actual:
+• pedir foreground,
+• luego background,
+• y devolver si ambos fueron concedidos o no. 3
+startMonitoringArrival()
+Debe cubrir:
+• Location.startGeofencingAsync(...),
+• con identifier, latitude, longitude, radius,
+• notifyOnEnter = true,
+• notifyOnExit = true. 3
+stopMonitoring()
+Debe cubrir:
+• Location.stopGeofencingAsync(GEOFENCE_TASK),
+• Location.stopLocationUpdatesAsync(GEOFENCE_TASK),
+• y limpieza de EXIT_TIMESTAMP_KEY. 3
+save/get/clearLastExitTimestamp()
+Debe reemplazar el uso actual de AsyncStorage sobre LAST_GEOFENCE_EXIT_TIMESTAMP. 3
+
+───
+
+4.3 Restricción obligatoria
+locationno debe:
+• cerrar sesiones,
+• escribir work_sessions,
+• decidir si una salida se convierte en auto checkout,
+• insertar auditoría.
+Hoy LocationManager.ts sí mezcla esas cosas. El nuevo contrato lo separa. 31
+
+───
+
+5. notifications — contrato concreto de notificaciones
+Este adapter reemplaza Notifications.ts y también la programación directa de notificaciones que hoy ocurre dentro de LocationManager.ts y BackgroundTasks.ts. 3
+
+───
+
+5.1 Contrato formal
+ts
+interface NotificationsAdapter {
+  requestPermissions(): Promise<{
+    status: "granted" | "denied" | "unknown";
+  }>;
+
+  ensureDefaultChannel(): Promise<void>;
+
+  scheduleImmediate(input: {
+    title: string;
+    body: string;
+    data?: Record<string, unknown>;
+    sound?: boolean;
+    priority?: "default" | "high" | "max";
+  }): Promise<void>;
+
+  scheduleDailyReminder(timeString: string): Promise<void>;
+
+  cancelAllScheduled(): Promise<void>;
+  dismissAllVisible(): Promise<void>;
+}
+
+
+───
+
+5.2 Responsabilidad exacta
+requestPermissions()
+Debe reflejar setupNotifications():
+• leer permisos existentes,
+• pedirlos si no están concedidos,
+• asegurar canal Android si aplica. 3
+scheduleImmediate()
+Debe absorber las notificaciones hoy repartidas en:
+• auto check-in,
+• salida detectada,
+• auto check-out,
+• reporte semanal listo. 3
+scheduleDailyReminder(timeString)
+Debe absorber exactamente la lógica de scheduleDailyReminder():
+• cancelar notificaciones previas,
+• validar formato HH:MM,
+• agendar trigger diario. 3
+
+───
+
+5.3 Restricción obligatoria
+notificationsno debe:
+• decidir si hay que notificar,
+• inferir estados del sistema,
+• decidir qué reporte corresponde.
+Solo ejecuta la programación / cancelación.
+
+───
+
+6. reports — contrato concreto de PDF, compartir y correo
+Este adapter reemplaza ReportGenerator.ts, que hoy:
+• consulta sesiones y audit logs,
+• calcula horas y pago,
+• construye HTML,
+• genera PDF,
+• comparte PDF,
+• y envía por correo. 32
+
+───
+
+6.1 Contrato formal
+ts
+interface ReportsAdapter {
+  generateWeeklyReport(input: {
+    settings: AppSettingsRecord;
+    sessions: SessionRecord[];
+    auditLogs: AuditLogRecord[];
+    range: { startAtMs: number; endAtMs: number; label?: string | null };
+    shouldShare: boolean;
+  }): Promise<{
+    uri: string | null;
+  }>;
+
+  shareReport(uri: string): Promise<void>;
+
+  sendReportByEmail(input: {
+    pdfUri: string;
+    companyEmail: string;
+    employeeName: string;
+  }): Promise<void>;
+}
+
+
+───
+
+6.2 Responsabilidad exacta
+generateWeeklyReport(...)
+Debe absorber:
+• armado del documento,
+• uso de formatDate, formatTime,
+• calculateSessionDuration,
+• calculatePay,
+• detección de AUTO_CHECKOUT a partir de audit logs,
+• Print.printToFileAsync(),
+• y sharing si shouldShare es verdadero. 32
+shareReport(uri)
+Debe absorber Sharing.shareAsync(uri). 3
+sendReportByEmail(...)
+Debe absorber:
+• MailComposer.isAvailableAsync(),
+• MailComposer.composeAsync(...),
+• fallback a Sharing.shareAsync(pdfUri) cuando no haya mail composer. 3
+
+───
+
+6.3 Restricción obligatoria
+reportsno debe:
+• leer directamente SQLite,
+• decidir el rango seleccionado,
+• decidir si el reporte es válido para la semana actual o anterior,
+• manejar lastReportedWeekId.
+Eso pertenece al store y al effect handler de reportes. Hoy ReportGenerator.ts mezcla consulta + cálculo + IO; este contrato lo desacopla. 31
+
+───
+
+7. security — contrato concreto de seguridad administrativa
+Este adapter reemplaza el flujo provisional de settings.tsx, donde hoy:
+• el hash del PIN está hardcodeado,
+• la validación usa expo-crypto,
+• y tu reporte de deuda técnica marca que debe migrarse a almacenamiento seguro. 5
+
+───
+
+7.1 Contrato formal
+ts
+interface SecurityAdapter {
+  validateAdminPin(pin: string): Promise<{
+    granted: boolean;
+  }>;
+
+  readAdminSecret(): Promise<string | null>;
+  writeAdminSecret(secret: string): Promise<void>;
+}
+
+
+───
+
+7.2 Responsabilidad exacta
+validateAdminPin(pin)
+Debe reemplazar verifyAdminPinSecurely() y conectarse con la fuente segura definitiva del secreto administrativo. Tu documento de deuda técnica ya define que el siguiente paso correcto es SecureStore. 5
+readAdminSecret() / writeAdminSecret()
+Existen para que el runtime pueda leer y administrar el secreto fuera del frontend duro.
+
+───
+
+7.3 Restricción obligatoria
+securityno debe:
+• desbloquear paneles visuales por sí solo,
+• emitir toast,
+• mutar settings,
+• ni decidir si una validación cambia el estado global.
+Solo valida y devuelve resultado.
+
+───
+
+8. logging — contrato concreto de observabilidad y feedback puente
+Este adapter reemplaza funcionalmente la combinación de logger.ts y logBridge.ts, donde hoy:
+• se guardan system_logs y audit_logs,
+• hay colas temporales,
+• se serializa metadata,
+• y se emite feedback según severidad/categoría. 24
+
+───
+
+8.1 Contrato formal
+ts
+interface LoggingAdapter {
+  appendSystemLog(entry: {
+    timestampMs: number;
+    timestampIso: string;
+    color: string;
+    category: string;
+    severity: string;
+    message: string;
+    metadataJson?: string | null;
+  }): Promise<void>;
+
+  appendAuditLog(entry: {
+    sessionId: number | null;
+    actionType: string;
+    details: string;
+    timestampMs: number;
+  }): Promise<void>;
+
+  mapLogToFeedback(input: {
+    severity: string;
+    category: string;
+    message: string;
+  }): Promise<FeedbackPayload | null>;
+}
+
+
+───
+
+8.2 Responsabilidad exacta
+appendSystemLog(...)
+Debe persistir logs equivalentes a system_logs. 12
+appendAuditLog(...)
+Debe persistir logs equivalentes a audit_logs. 12
+mapLogToFeedback(...)
+Debe reemplazar la responsabilidad de logBridge.ts:
+• filtrado por severidad/categoría,
+• humanización del mensaje,
+• mapeo a FeedbackPayload,
+• dedupe/throttling a través de la capa de runtime o de un submódulo asociado. 4
+
+───
+
+8.3 Restricción obligatoria
+loggingno debe renderizar UX.
+ Solo:
+• persiste logs,
+• traduce logs a payload de feedback,
+• y entrega ese payload al effect handler o cola de feedback.
+Eso respeta el hecho de que el render real sigue viviendo en ToastContext.tsx. 74
+
+───
+
+9. Contrato de implementación integrado
+9.1 Ensamblado final
+ts
+const runtimeAdapter: WorkTrackerRuntimeAdapter = {
+  sessionStore,
+  location,
+  notifications,
+  reports,
+  security,
+  logging,
+};
+
+
+───
+
+9.2 Regla operativa
+Cada effect handler recibe runtimeAdapter y usa solo el adapter que le corresponde.
+Ejemplos correctos
+• handleSessionCreated → sessionStore + location + logging + notifications132
+• handleSessionAutoCheckoutGps → sessionStore + location + notifications + logging31
+• handleReportGenerationStarted → sessionStore + reports + logging312
+• handleAdminAccessValidationStarted → security + logging54
+• handleSystemLogAppended → logging2
+
+───
+
+10. Regla de reemplazo directo contra tu sistema actual
+Este runtime adapter sustituye, módulo por módulo:
+
+Módulo actual
+Adapter nuevo
+
+db.ts
+sessionStore 1
+
+LocationManager.ts
+location 3
+
+Notifications.ts
+notifications 3
+
+ReportGenerator.ts
+reports 3
+
+logger.ts
+logging.appendSystemLog + logging.appendAuditLog 2
+
+logBridge.ts
+logging.mapLogToFeedback 4
+
+validación provisional en settings.tsx
+security 5
+
+
+
+───
+
+11. Resultado
+Con este contrato ya tienes definido, de forma concreta:
+• qué hace cada adapter
+• qué métodos expone
+• qué datos maneja
+• qué reemplaza del sistema actual
+• qué NO puede hacer
+
+───

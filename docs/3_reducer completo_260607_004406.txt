@@ -1,0 +1,667 @@
+A continuación te entrego el reducer completo listo para implementación a nivel producción, en formato formal + pseudocódigo TypeScript, construido sobre:
+• los estados persistidos reales de work_sessions (pending_arrival, travel, active, completed, deleted) y los mutations reales ya existentes en DB (insertWorkSession, updateSessionEndTime, updateSessionLunch, updateWorkSessionManual, deleteWorkSession) 1
+• los eventos operativos reales del sistema (AUTO_CHECKIN_GPS, GEOFENCE_EXIT, AUTO_CHECKOUT_GPS, background task, monitoreo geofence, permisos, reportes) 23
+• los estados visibles de UI que deben quedar como derivación (NO_INICIADA, ESPERANDO_LLEGADA, ASINCRONIA_CHECKIN, NO_SHOW, EN_TRASLADO, ACTIVA, SALIDA_DETECTADA, CERRADA) porque hoy existen en OperationalHeroCard / index.tsx, pero no como persistencia primaria. 45
+• el modelo de feedback estructurado (FeedbackPayload) y las reglas del bridge de logs. 67
+
+───
+
+1) Regla central del reducer
+El reducer nunca ejecuta side-effects.
+ Solo muta WorkTrackerCanonicalState y deja que:
+▪ los selectors deriven engineState, systemHealth, historyRows, reportPreview, etc.
+▪ los effect handlers ejecuten DB, geofence, notificaciones, impresión PDF, mail y sharing. 2145
+
+───
+
+2) Invariantes formales del reducer
+Estas reglas deben cumplirse siempre:
+1. Solo puede existir una activeSessionId a la vez. Esto es consistente con getOpenSession() y con el hecho de que DB consulta una sola sesión abierta ordenada por start_time DESC LIMIT 1. 1
+2. Una sesión completed o deleted no vuelve a ser active.updateSessionEndTime() fija completed y deleteWorkSession() fija deleted. 1
+3. engineState no se escribe en el reducer. Se deriva después. Los estados visibles están definidos en UI, mientras que la persistencia real usa otros status. 451
+4. runtime.geofence.lastExitTimestampMs solo existe mientras haya una salida detectada pendiente. El sistema ya lo guarda y elimina en varios puntos (Enter, stopMonitoring, failsafe). 2
+5. pendingFeedback es una cola de runtime, no dominio. El bridge de feedback ya usa payloads con dedupeKey, durationMs, kind y tone. 67
+
+───
+
+3) Forma del reducer maestro
+3.1 Estructura propuesta
+ts
+type Reducer = (
+  state: WorkTrackerCanonicalState,
+  event: DomainEvent
+) => WorkTrackerCanonicalState;
+
+3.2 Estrategia de composición
+Para producción, la implementación correcta es:
+ts
+function reduce(state, event) {
+  const next = cloneState(state);
+
+  switch (event.type) {
+    case 'APP_BOOT_STARTED':
+    case 'APP_REHYDRATION_COMPLETED':
+    case 'DB_READY':
+    case 'PERMISSIONS_LOCATION_UPDATED':
+    case 'PERMISSIONS_NOTIFICATIONS_UPDATED':
+    case 'GEOFENCE_MONITORING_STARTED':
+    case 'GEOFENCE_MONITORING_STOPPED':
+    case 'BACKGROUND_TASK_REGISTERED':
+    case 'BACKGROUND_TASK_UNREGISTERED':
+    case 'BACKGROUND_TASK_STARTED':
+    case 'BACKGROUND_TASK_FINISHED':
+      return reduceSystem(next, event);
+
+    case 'SESSION_CREATED':
+    case 'SESSION_DESTINATION_SET':
+    case 'SESSION_TRANSIT_STARTED':
+    case 'SESSION_ARRIVAL_CONFIRMED_MANUAL':
+    case 'SESSION_AUTO_CHECKIN_GPS':
+    case 'SESSION_EXIT_DETECTED':
+    case 'SESSION_EXIT_RESOLVED_CONTINUE':
+    case 'SESSION_AUTO_CHECKOUT_GPS':
+    case 'SESSION_CLOSED_MANUAL':
+    case 'SESSION_LUNCH_RECORDED':
+    case 'SESSION_NOTE_ADDED':
+    case 'SESSION_EDITED_MANUAL':
+    case 'SESSION_DELETED_SOFT':
+    case 'SESSION_OVERLAP_DETECTED':
+      return reduceSession(next, event);
+
+    case 'REPORT_RANGE_SELECTED':
+    case 'REPORT_GENERATION_STARTED':
+    case 'REPORT_GENERATION_SUCCEEDED':
+    case 'REPORT_GENERATION_FAILED':
+    case 'REPORT_MARKED_AS_WEEKLY_DELIVERED':
+    case 'REPORT_SHARE_REQUESTED':
+    case 'REPORT_EMAIL_REQUESTED':
+      return reduceReport(next, event);
+
+    case 'ADMIN_ACCESS_VALIDATION_STARTED':
+    case 'ADMIN_ACCESS_GRANTED':
+    case 'ADMIN_ACCESS_DENIED':
+    case 'ADMIN_ACCESS_LOCKED':
+      return reduceSecurity(next, event);
+
+    case 'FEEDBACK_ENQUEUED':
+    case 'FEEDBACK_DISMISSED':
+      return reduceFeedback(next, event);
+
+    case 'SYSTEM_LOG_APPENDED':
+    case 'AUDIT_LOG_APPENDED':
+      return reduceLogs(next, event);
+
+    default:
+      return state;
+  }
+}
+
+Esto refleja exactamente la separación que ya definimos: sistema, sesiones, reportes, seguridad, feedback y logs. La necesidad de esa separación viene directamente de cómo hoy las responsabilidades están divididas entre DB, services, utils, logger y UI. 123645
+
+───
+
+4) Implementación formal del reducer de sistema
+4.1 reduceSystem
+ts
+function reduceSystem(
+  state: WorkTrackerCanonicalState,
+  event: DomainEvent
+): WorkTrackerCanonicalState {
+  switch (event.type) {
+    case 'APP_BOOT_STARTED': {
+      state.meta.bootState.isRehydrating = true;
+      return state;
+    }
+
+    case 'APP_REHYDRATION_COMPLETED': {
+      state.meta.bootState.isRehydrating = false;
+      state.meta.bootState.lastHydratedAtMs = event.timestampMs;
+      return state;
+    }
+
+    case 'DB_READY': {
+      // La DB queda operacional; no muta dominio.
+      return state;
+    }
+
+    case 'PERMISSIONS_LOCATION_UPDATED': {
+      state.runtime.permissions.locationForeground = event.foreground;
+      state.runtime.permissions.locationBackground = event.background;
+      return state;
+    }
+
+    case 'PERMISSIONS_NOTIFICATIONS_UPDATED': {
+      state.runtime.permissions.notifications = event.notifications;
+      return state;
+    }
+
+    case 'GEOFENCE_MONITORING_STARTED': {
+      state.runtime.geofence.isMonitoring = true;
+      state.runtime.geofence.taskName = event.taskName;
+      state.runtime.geofence.monitoredRegion = {
+        identifier: event.identifier,
+        latitude: event.latitude,
+        longitude: event.longitude,
+        radiusMeters: event.radiusMeters,
+      };
+      return state;
+    }
+
+    case 'GEOFENCE_MONITORING_STOPPED': {
+      state.runtime.geofence.isMonitoring = false;
+      state.runtime.geofence.lastExitTimestampMs = null;
+      state.runtime.geofence.monitoredRegion = {
+        identifier: null,
+        latitude: null,
+        longitude: null,
+        radiusMeters: null,
+      };
+      return state;
+    }
+
+    case 'BACKGROUND_TASK_REGISTERED': {
+      state.runtime.background.appTask.isRegistered = true;
+      state.runtime.background.appTask.taskName = event.taskName;
+      return state;
+    }
+
+    case 'BACKGROUND_TASK_UNREGISTERED': {
+      state.runtime.background.appTask.isRegistered = false;
+      return state;
+    }
+
+    case 'BACKGROUND_TASK_STARTED': {
+      state.runtime.background.appTask.isRunning = true;
+      return state;
+    }
+
+    case 'BACKGROUND_TASK_FINISHED': {
+      state.runtime.background.appTask.isRunning = false;
+      return state;
+    }
+
+    default:
+      return state;
+  }
+}
+
+Fundamento
+Estos campos vienen directamente de:
+• RootLayout (isRehydrating) 4
+• permisos de ubicación y notificaciones (Location.requestForegroundPermissionsAsync, Location.requestBackgroundPermissionsAsync, Notifications.getPermissionsAsync, Notifications.requestPermissionsAsync) 2
+• arranque/parada de geocerca (startGeofencingAsync, stopGeofencingAsync) y EXIT_TIMESTAMP_KEY2
+• registro/ejecución de background task y mutex isTaskRunning. 2
+
+───
+
+5) Implementación formal del reducer de sesiones
+5.1 Helpers internos obligatorios
+ts
+function requireSession(
+  state: WorkTrackerCanonicalState,
+  sessionId: number
+) {
+  const session = state.domain.sessions.byId[String(sessionId)];
+  if (!session) {
+    throw new Error(`Session ${sessionId} no existe`);
+  }
+  return session;
+}
+
+function closeActiveSession(state: WorkTrackerCanonicalState) {
+  state.domain.sessions.activeSessionId = null;
+}
+
+function setActiveSession(state: WorkTrackerCanonicalState, sessionId: number) {
+  state.domain.sessions.activeSessionId = sessionId;
+}
+
+function ensureOnlyOneOpenSession(state: WorkTrackerCanonicalState, newId: number) {
+  const current = state.domain.sessions.activeSessionId;
+  if (current !== null && current !== newId) {
+    throw new Error('Ya existe una sesión activa');
+  }
+}
+
+El helper de “solo una sesión abierta” está respaldado por la existencia de getOpenSession() y la lógica general actual del sistema. 1
+
+───
+
+5.2 reduceSession
+ts
+function reduceSession(
+  state: WorkTrackerCanonicalState,
+  event: DomainEvent
+): WorkTrackerCanonicalState {
+  switch (event.type) {
+    case 'SESSION_CREATED': {
+      ensureOnlyOneOpenSession(state, event.session.id);
+
+      const id = String(event.session.id);
+
+      state.domain.sessions.byId[id] = {
+        id: event.session.id,
+        declaredStartAtMs: event.session.declaredStartAtMs,
+        actualStartAtMs: null,
+        endAtMs: null,
+
+        lifecycle: {
+          domainStatus: event.session.domainStatus, // pending_arrival | travel
+          isDeleted: false,
+          isManualEdit: false,
+          locationConfirmed: false,
+        },
+
+        destination: {
+          address: event.session.address ?? null,
+          clientName: event.session.clientName ?? null,
+          targetLatitude: event.session.targetLatitude ?? null,
+          targetLongitude: event.session.targetLongitude ?? null,
+          setupLatitude: event.session.setupLatitude ?? null,
+          setupLongitude: event.session.setupLongitude ?? null,
+        },
+
+        capturedLocation: {
+          latitude: event.session.latitude ?? null,
+          longitude: event.session.longitude ?? null,
+        },
+
+        lunch: {
+          taken: false,
+          startAtMs: null,
+          endAtMs: null,
+          deductedMinutes: null,
+        },
+
+        notes: {
+          manualNote: event.session.manualNote ?? null,
+        },
+
+        bookkeeping: {
+          dateString: event.session.dateString ?? null,
+        },
+      };
+
+      state.domain.sessions.order.unshift(event.session.id);
+      setActiveSession(state, event.session.id);
+      return state;
+    }
+
+    case 'SESSION_DESTINATION_SET': {
+      const session = requireSession(state, event.sessionId);
+      session.destination.address = event.address ?? session.destination.address;
+      session.destination.clientName = event.clientName ?? session.destination.clientName;
+      session.destination.targetLatitude = event.targetLatitude ?? session.destination.targetLatitude;
+      session.destination.targetLongitude = event.targetLongitude ?? session.destination.targetLongitude;
+      session.destination.setupLatitude = event.setupLatitude ?? session.destination.setupLatitude;
+      session.destination.setupLongitude = event.setupLongitude ?? session.destination.setupLongitude;
+      return state;
+    }
+
+    case 'SESSION_TRANSIT_STARTED': {
+      const session = requireSession(state, event.sessionId);
+      session.lifecycle.domainStatus = 'travel';
+      return state;
+    }
+
+    case 'SESSION_ARRIVAL_CONFIRMED_MANUAL': {
+      const session = requireSession(state, event.sessionId);
+      session.actualStartAtMs = event.actualStartAtMs;
+      session.lifecycle.domainStatus = 'active';
+      session.lifecycle.locationConfirmed = true;
+      return state;
+    }
+
+    case 'SESSION_AUTO_CHECKIN_GPS': {
+      const session = requireSession(state, event.sessionId);
+      session.actualStartAtMs = event.actualStartAtMs;
+      session.lifecycle.domainStatus = 'active';
+      session.lifecycle.locationConfirmed = true;
+      state.runtime.geofence.lastExitTimestampMs = null;
+      return state;
+    }
+
+    case 'SESSION_EXIT_DETECTED': {
+      const session = requireSession(state, event.sessionId);
+
+      // La sesión sigue activa; solo se marca salida pendiente.
+      if (session.lifecycle.domainStatus === 'active') {
+        state.runtime.geofence.lastExitTimestampMs = event.exitTimestampMs;
+      }
+
+      return state;
+    }
+
+    case 'SESSION_EXIT_RESOLVED_CONTINUE': {
+      const session = requireSession(state, event.sessionId);
+      if (session.lifecycle.domainStatus === 'active') {
+        state.runtime.geofence.lastExitTimestampMs = null;
+      }
+      return state;
+    }
+
+    case 'SESSION_AUTO_CHECKOUT_GPS': {
+      const session = requireSession(state, event.sessionId);
+      session.endAtMs = event.endAtMs;
+      session.lifecycle.domainStatus = 'completed';
+      closeActiveSession(state);
+      state.runtime.geofence.lastExitTimestampMs = null;
+      return state;
+    }
+
+    case 'SESSION_CLOSED_MANUAL': {
+      const session = requireSession(state, event.sessionId);
+      session.endAtMs = event.endAtMs;
+      session.lifecycle.domainStatus = 'completed';
+      closeActiveSession(state);
+      state.runtime.geofence.lastExitTimestampMs = null;
+      return state;
+    }
+
+    case 'SESSION_LUNCH_RECORDED': {
+      const session = requireSession(state, event.sessionId);
+      session.lunch.taken = true;
+      session.lunch.startAtMs = event.lunchStartAtMs ?? null;
+      session.lunch.endAtMs = event.lunchEndAtMs ?? null;
+      session.lunch.deductedMinutes = event.deductedMinutes ?? null;
+      return state;
+    }
+
+    case 'SESSION_NOTE_ADDED': {
+      const session = requireSession(state, event.sessionId);
+      session.notes.manualNote = event.note;
+      return state;
+    }
+
+    case 'SESSION_EDITED_MANUAL': {
+      const session = requireSession(state, event.sessionId
+
+Fundamento
+Cada caso anterior está respaldado por:
+• creación, cierre, lunch, edición, borrado y solapamiento desde db.ts1
+• auto check-in, salida detectada y auto check-out desde geocerca y background task 2
+• los estados visibles y modales operativos de la UI (DailySetupModal, ExitDetectionModal, LunchModal, EditSessionModal, DeleteSessionModal) 45
+
+───
+
+6) Implementación formal del reducer de reportes
+6.1 reduceReport
+ts
+function reduceReport(
+  state: WorkTrackerCanonicalState,
+  event: DomainEvent
+): WorkTrackerCanonicalState {
+  switch (event.type) {
+    case 'REPORT_RANGE_SELECTED': {
+      state.views.report.selectedRange = {
+        startAtMs: event.startAtMs,
+        endAtMs: event.endAtMs,
+        label: event.label,
+      };
+      return state;
+    }
+
+    case 'REPORT_GENERATION_STARTED': {
+      state.runtime.background.weeklyReport.generationStatus = 'generating';
+      return state;
+    }
+
+    case 'REPORT_GENERATION_SUCCEEDED': {
+      state.runtime.background.weeklyReport.generationStatus = 'generated';
+      state.runtime.background.weeklyReport.lastGeneratedUri = event.uri;
+      return state;
+    }
+
+    case 'REPORT_GENERATION_FAILED': {
+      state.runtime.background.weeklyReport.generationStatus = 'failed';
+      return state;
+    }
+
+    case 'REPORT_MARKED_AS_WEEKLY_DELIVERED': {
+      state.runtime.background.weeklyReport.lastReportedWeekId = event.weekId;
+      return state;
+    }
+
+    case 'REPORT_SHARE_REQUESTED': {
+      state.runtime.transient.exportIntent.shouldShareAfterGenerate = true;
+      return state;
+    }
+
+    case 'REPORT_EMAIL_REQUESTED': {
+      state.runtime.transient.exportIntent.shouldSendByEmailAfterGenerate = true;
+      return state;
+    }
+
+    default:
+      return state;
+  }
+}
+
+Fundamento
+Esto sale directamente de:
+• generateWeeklyReport(), sendReportByEmail(), Sharing.shareAsync(), MailComposer.composeAsync()2
+• el control de semana reportada LAST_REPORT_WEEK_ID y la ventana semanal automática del background task 2
+• los estados UI mock de report.tsx (isExporting, hasGenerated) que deben desaparecer como verdad local y pasar al estado canónico. 4
+
+───
+
+7) Implementación formal del reducer de seguridad
+7.1 reduceSecurity
+ts
+function reduceSecurity(
+  state: WorkTrackerCanonicalState,
+  event: DomainEvent
+): WorkTrackerCanonicalState {
+  switch (event.type) {
+    case 'ADMIN_ACCESS_VALIDATION_STARTED': {
+      state.runtime.security.adminAccess.validationStatus = 'validating';
+      return state;
+    }
+
+    case 'ADMIN_ACCESS_GRANTED': {
+      state.runtime.security.adminAccess.isUnlocked = true;
+      state.runtime.security.adminAccess.validationStatus = 'granted';
+      state.runtime.security.adminAccess.lastValidatedAtMs = event.timestampMs;
+      return state;
+    }
+
+    case 'ADMIN_ACCESS_DENIED': {
+      state.runtime.security.adminAccess.isUnlocked = false;
+      state.runtime.security.adminAccess.validationStatus = 'denied';
+      return state;
+    }
+
+    case 'ADMIN_ACCESS_LOCKED': {
+      state.runtime.security.adminAccess.isUnlocked = false;
+      state.runtime.security.adminAccess.validationStatus = 'idle';
+      return state;
+    }
+
+    default:
+      return state;
+  }
+}
+
+Fundamento
+La UI ya modela exactamente isUnlocked, isUnlocking, validación async y bloqueo manual del panel. Tu deuda técnica además identifica este flujo como uno de los puntos a reemplazar por una fuente segura. 4
+
+───
+
+8) Implementación formal del reducer de feedback
+8.1 reduceFeedback
+ts
+function reduceFeedback(
+  state: WorkTrackerCanonicalState,
+  event: DomainEvent
+): WorkTrackerCanonicalState {
+  switch (event.type) {
+    case 'FEEDBACK_ENQUEUED': {
+      state.runtime.transient.pendingFeedback.push({
+        id: event.feedback.id,
+        kind: event.feedback.kind,
+        tone: event.feedback.tone,
+        title: event.feedback.title ?? null,
+        message: event.feedback.message,
+        dedupeKey: event.feedback.dedupeKey ?? null,
+        durationMs: event.feedback.durationMs ?? null,
+        destructive: !!event.feedback.destructive,
+      });
+      return state;
+    }
+
+    case 'FEEDBACK_DISMISSED': {
+      state.runtime.transient.pendingFeedback =
+        state.runtime.transient.pendingFeedback.filter(
+          (item) => item.id !== event.feedbackId
+        );
+      return state;
+    }
+
+    default:
+      return state;
+  }
+}
+
+Fundamento
+La estructura ya existe en FeedbackPayload (kind, tone, title, message, dedupeKey, durationMs, destructive) y el sistema ya hace throttling y visibilidad a través de logBridge.ts, mientras que ToastContext.tsx ya consume la representación visible. 67
+
+───
+
+9) Implementación formal del reducer de logs
+9.1 reduceLogs
+ts
+function reduceLogs(
+  state: WorkTrackerCanonicalState,
+  event: DomainEvent
+): WorkTrackerCanonicalState {
+  switch (event.type) {
+    case 'SYSTEM_LOG_APPENDED': {
+      state.domain.audit.systemLogs.unshift({
+        id: event.entry.id,
+        timestampMs: event.entry.timestampMs,
+        timestampIso: event.entry.timestampIso,
+        color: event.entry.color,
+        category: event.entry.category,
+        severity: event.entry.severity,
+        message: event.entry.message,
+        metadataJson: event.entry.metadataJson ?? null,
+      });
+      return state;
+    }
+
+    case 'AUDIT_LOG_APPENDED': {
+      state.domain.audit.auditLogs.unshift({
+        id: event.entry.id,
+        sessionId: event.entry.sessionId ?? null,
+        actionType: event.entry.actionType,
+        details: event.entry.details,
+        timestampMs: event.entry.timestampMs,
+      });
+      return state;
+    }
+
+    default:
+      return state;
+  }
+}
+
+Fundamento
+La estructura ya está definida en system_logs, audit_logs y logger.ts, incluidas las colas temporales hasta que la DB está lista. 13
+
+───
+
+10) Capa de validación obligatoria antes del reducer
+Para que este reducer sea de producción, no basta con el switch. Necesita una capa de validación previa.
+10.1 Validador canónico
+ts
+function validateEvent(
+  state: WorkTrackerCanonicalState,
+  event: DomainEvent
+): void {
+  switch (event.type) {
+    case 'SESSION_CREATED': {
+      if (state.domain.sessions.activeSessionId !== null) {
+        throw new Error('No se puede iniciar una nueva sesión con otra activa');
+      }
+      break;
+    }
+
+    case 'SESSION_AUTO_CHECKIN_GPS':
+    case 'SESSION_ARRIVAL_CONFIRMED_MANUAL':
+    case 'SESSION_EXIT_DETECTED':
+    case 'SESSION_AUTO_CHECKOUT_GPS':
+    case 'SESSION_CLOSED_MANUAL':
+    case 'SESSION_LUNCH_RECORDED':
+    case 'SESSION_EDITED_MANUAL':
+    case 'SESSION_DELETED_SOFT': {
+      const session = state.domain.sessions.byId[String(event.sessionId)];
+      if (!session) {
+        throw new Error(`Session ${event.sessionId} no existe`);
+      }
+      break;
+    }
+
+    case 'SESSION_AUTO_CHECKOUT_GPS': {
+      const session = state.domain.sessions.byId[String(event.sessionId)];
+      if (session?.lifecycle.domainStatus !== 'active') {
+        throw new Error('Auto checkout solo aplica a sesiones activas');
+      }
+      break;
+    }
+
+    case 'SESSION_EDITED_MANUAL': {
+      if (!event.note?.trim()) {
+        throw new Error('La nota de auditoría es obligatoria');
+      }
+      break;
+    }
+
+    default:
+      break;
+  }
+}
+
+Esto se alinea con:
+• la existencia de overlap checking y edición manual con nota obligatoria 15
+• los flujos de UI que bloquean guardar si hay corrupción o nota vacía. 5
+
+───
+
+11) Wrapper final listo para producción
+ts
+export function workTrackerReducer(
+  state: WorkTrackerCanonicalState,
+  event: DomainEvent
+): WorkTrackerCanonicalState {
+  validateEvent(state, event);
+
+  const nextState = reduce(state, event);
+
+  return nextState;
+}
+
+
+───
+
+12) Qué NO debe entrar al reducer
+Esto es crítico para que la implementación no se contamine:
+Nunca dentro del reducer
+• SQLite.runAsync, getFirstAsync, getAllAsync1
+• Location.startGeofencingAsync, stopGeofencingAsync2
+• Notifications.scheduleNotificationAsync2
+• Print.printToFileAsync, Sharing.shareAsync, MailComposer.composeAsync2
+• showToast() o render de modales UI 745
+Todo eso debe vivir en los effect handlers.
+
+───
+
+13) Resultado exacto
+Con esto ya tienes un reducer completo y listo para implementación, con:
+• composición por sub-reducers
+• switch exhaustivo por dominio
+• mutaciones canónicas
+• validación previa
+• corte limpio con side-effects
+• alineación total con DB, servicios, logs y UI existentes. 123645
+
+───

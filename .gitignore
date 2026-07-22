@@ -1,0 +1,90 @@
+# ============================
+# DEPENDENCIAS Y BUILD
+# ============================
+**/node_modules/
+**/dist/
+**/web-build/
+**/build/
+**/coverage/
+**/*.log
+**/*.tsbuildinfo
+
+# ============================
+# EXPO / REACT NATIVE
+# ============================
+**/.expo/
+**/.expo-shared/
+**/expo-env.d.ts
+
+# ============================
+# NATIVO (Android / iOS)
+# ============================
+**/android/
+**/ios/
+**/*.jks
+**/*.keystore
+**/*.p8
+**/*.p12
+**/*.key
+**/*.pem
+**/*.mobileprovision
+**/.kotlin/
+**/*.orig.*
+
+# ============================
+# CONFIGURACIÓN LOCAL / SECRETOS
+# ============================
+**/.env
+**/.env.*
+!**/.env.example
+**/cookies.txt
+**/google-services.json
+**/GoogleService-Info.plist
+**/firebase-adminsdk*.json
+**/eas-credentials.json
+
+# ============================
+# EDITORES / HERRAMIENTAS LOCALES
+# ============================
+**/.vscode/*
+!**/.vscode/settings.json
+!**/.vscode/extensions.json
+**/.idea/
+**/.docs
+**/.jules/
+**/.Jules/
+
+# ============================
+# DEBUG / LOGS
+# ============================
+**/npm-debug.*
+**/yarn-debug.*
+**/yarn-error.*
+**/pnpm-debug.*
+
+# ============================
+# SISTEMA OPERATIVO
+# ============================
+**/.DS_Store
+**/Thumbs.db
+
+# ============================
+# BASES DE DATOS LOCALES / SQLITE
+# ============================
+**/*.db-journal
+**/*.db-shm
+**/*.db-wal
+
+# ============================
+# AUDITORÍA / TEMPORALES
+# ============================
+**/scripts/audit/reports/
+**/tmp/
+**/temp/
+**/.cache/
+
+# ============================
+# ARCHIVOS GENERADOS
+# ============================
+**/app-example
+

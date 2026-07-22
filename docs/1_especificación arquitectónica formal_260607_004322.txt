@@ -1,0 +1,427 @@
+Especificación arquitectónica formal, no como código, y separando con precisión:
+• estado
+• eventos
+• derivaciones
+• sistema
+Lo que sigue es una propuesta canónica unificada construida a partir de:
+• la persistencia y automatizaciones reales de db.ts, BackgroundTasks.ts, LocationManager.ts, Notifications.ts y ReportGenerator.ts12
+• la capa de utilidades, logging y feedback (dayjsSetup, payrollUtils, logger, logBridge) 34
+• la arquitectura visual y de navegación de WTracker (theme, ToastContext, pantallas, modales y componentes UI) 5678
+• y tu reporte de deuda técnica, que identifica los mocks y estados volátiles que deben ser absorbidos por una única fuente de verdad.
+
+───
+
+1) Principio rector del modelo
+El modelo canónico debe cumplir esta regla:
+La UI no conserva verdad de negocio; solo consume estado derivado y dispara eventos.
+Esto es consistente con que hoy la verdad real ya existe fragmentada entre work_sessions, settings, audit_logs, system_logs, AsyncStorage, geocerca, background tasks, feedback UX y estados simulados en UI. 123478
+
+───
+
+2) Dump formal del estado canónico (propuesta v1)
+Nombre del agregado raíz:WorkTrackerCanonicalState
+yaml
+WorkTrackerCanonicalState:
+  meta:
+    schemaVersion: 1
+    timezone: "America/Los_Angeles"
+    locale: "es|en"
+    bootState:
+      isRehydrating: boolean
+      lastHydratedAtMs: number | null
+
+  domain:
+    sessions:
+      byId:
+        "<sessionId>":
+          id: number
+          declaredStartAtMs: number
+          actualStartAtMs: number | null
+          endAtMs: number | null
+
+          lifecycle:
+            domainStatus: "pending_arrival | travel | active | completed | deleted"
+            isDeleted: boolean
+            isManualEdit: boolean
+            locationConfirmed: boolean
+
+          destination:
+            address: string | null
+            clientName: string | null
+            targetLatitude: number | null
+            targetLongitude: number | null
+            setupLatitude: number | null
+            setupLongitude: number | null
+
+          capturedLocation:
+            latitude: number | null
+            longitude: number | null
+
+          lunch:
+            taken: boolean
+            startAtMs: number | null
+            endAtMs: number | null
+            deductedMinutes: number | null
+
+          notes:
+            manualNote: string | null
+
+          bookkeeping:
+            dateString: string | null
+
+      order: number[]
+      activeSessionId: number | null
+
+    settings:
+      employeeName: string
+      employerName: string
+      companyEmail: string
+      toleranceRadiusMeters: number
+      hourlyRate: number
+      language: "es | en"
+      dailyReminderTime: string
+      overtimeMultiplier: number
+
+    audit:
+      auditLogs:
+        - id: number
+          sessionId: number | null
+          actionType: string
+          details: string
+          timestampMs: number
+
+      systemLogs:
+        - id: number
+          timestampMs: number
+          timestampIso: string
+          color: string
+          category: string
+          severity: string
+          message: string
+          metadataJson: string | null
+
+  runtime:
+    permissions:
+      locationForeground: "unknown | granted | denied"
+      locationBackground: "unknown | granted | denied"
+      notifications: "unknown | granted | denied"
+
+    geofence:
+      isMonitoring: boolean
+      taskName: string
+      lastExitTimestampMs: number | null
+      monitoredRegion:
+        identifier: string | null
+        latitude: number | null
+        longitude: number | null
+        radiusMeters: number | null
+
+    background:
+      appTask:
+        isRegistered: boolean
+        isRunning: boolean
+        taskName: string
+      weeklyReport:
+        lastReportedWeekId: string | null
+        lastGeneratedUri: string | null
+        generationStatus: "idle | generating | generated | failed"
+
+    notifications:
+      defaultChannelReady: boolean
+      lastScheduledReminderTime: string | null
+
+    security:
+      adminAccess:
+        isUnlocked: boolean
+        lastValidatedAtMs: number | null
+        validationStatus: "idle | validating | granted | denied | error"
+
+    transient:
+      pendingFeedback:
+        - id: string
+          kind: "toast | dialog"
+          tone: "success | error | info | warning"
+          title: string | null
+          message: string
+          dedupeKey: string | null
+          durationMs: number | null
+          destructive: boolean
+
+      draftNotesBySessionId:
+        "<sessionId>": string
+
+      exportIntent:
+        shouldShareAfterGenerate: boolean
+        shouldSendByEmailAfterGenerate: boolean
+
+  views:
+    currentOperationalState:
+      engineState: "NO_INICIADA | ESPERANDO_LLEGADA | ASINCRONIA_CHECKIN | NO_SHOW | EN_TRASLADO | ACTIVA | SALIDA_DETECTADA | CERRADA"
+
+    selectedSession:
+      selectedSessionId: number | null
+
+    history:
+      activeFilter: "Todos | Semana | Mes"
+
+    report:
+      selectedRange:
+        startAtMs: number | null
+        endAtMs: number | null
+        label: string | null
+
+  derived:
+    todaySummary:
+      totalWorkedMs: number
+      totalWorkedHours: number
+      grossPay: number
+      overtimeHours: number
+
+    weeklySummary:
+      startAtMs: number | null
+      endAtMs: number | null
+      totalWorkedMs: number
+      totalWorkedHours: number
+      grossPay: number
+      overtimeHours: number
+      sessionCount: number
+
+    sessionComputed:
+      byId:
+        "<sessionId>":
+          effectiveDurationMs: number
+          effectiveHours: number
+          regularHours: number
+          overtimeHours: number
+          totalPay: number
+          integrityBadge: "valid | manual | auto | warning | error"
+          hadAutoCheckin: boolean
+          hadAutoCheckout: boolean
+
+    systemHealth:
+      gpsState: "inactive | tracking | degraded"
+      syncState: "ok | pending"
+      isOperationallyHealthy: boolean
+
+    feedbackViewModel:
+      nextVisibleFeedback:
+        id: string | null
+        kind: "toast | dialog | none"
+        tone: "success | error | info | warning | none"
+        title: string | null
+        message: string | null
+
+
+───
+
+3) Base real de cada sección del dump
+3.1 meta
+La zona horaria global ya está fijada en America/Los_Angeles desde dayjsSetup.ts, y el idioma operativo real del sistema es es/en vía settings.language e i18n.ts. Además, WTracker ya modela un arranque con rehidratación (isRehydrating) en app/_layout.tsx. 317
+3.2 domain.sessions
+Los campos del agregado sessions salen directamente de work_sessions: start_time, actual_start_time, end_time, status, coordenadas, address, client_name, location_confirmed, is_manual_edit, manual_note, lunch_taken, lunch_start, lunch_end y date_string. Los estados reales persistidos detectados son pending_arrival, travel, active, completed y deleted. 12
+3.3 domain.settings
+Los ajustes reales persistidos ya existen en settings: employee_name, employer_name, company_email, tolerance_radius, hourly_rate, language, start_time y overtime_multiplier. La UI de ajustes además ya refleja estos mismos conceptos: nombre, tarifa, hora base, multiplicador y email/empresa. 137
+3.4 domain.audit
+La auditoría real existe en dos capas: audit_logs y system_logs. logger.ts define la escritura estructurada de ambos y mantiene colas de respaldo hasta que la DB está lista. db.ts además registra auditoría en creación, cierre, lunch, edición manual, eliminación y settings. 13
+3.5 runtime.permissions, runtime.geofence, runtime.background, runtime.notifications
+El sistema operativo ya participa directamente en permisos de ubicación y notificaciones (Location.requestForegroundPermissionsAsync, Location.requestBackgroundPermissionsAsync, Notifications.getPermissionsAsync, Notifications.requestPermissionsAsync). La geocerca usa GEOFENCE_TRACKING_TASK y el timestamp efímero LAST_GEOFENCE_EXIT_TIMESTAMP. Las tareas en segundo plano usan APP_BACKGROUND_SERVICES, mutex interno isTaskRunning y control de semana reportada con LAST_REPORT_WEEK_ID. 2
+3.6 runtime.security
+La UI actual ya modela seguridad administrativa con isUnlocked, isUnlocking, pin, pinError y una validación async simulada en settings.tsx. Tu reporte de deuda técnica además marca explícitamente este punto como infraestructura temporal que debe moverse a almacenamiento seguro. 7
+3.7 runtime.transient.pendingFeedback
+El sistema de feedback ya tiene una estructura formal en FeedbackPayload: kind, tone, title, message, dedupeKey, durationMs y destructive. Además, logBridge.ts introduce throttling y deduplicación, por lo que el feedback ya debe considerarse parte del runtime del sistema y no solo de la UI. 46
+3.8 views
+Hoy existen estados de vista y selección que la UI ya consume: engineState en Home, filtros de historial (Todos, Semana, Mes), rango seleccionado del reporte y navegación por session/[id]. Por eso estos datos deben existir, pero como vista derivada/controlada, no como verdad de negocio autónoma. 78
+3.9 derived
+Las derivaciones reales ya existen o están implícitas en el sistema: duración y pago salen de calculateSessionDuration y calculatePay; el resumen semanal existe en getWeeklyStats y en generateWeeklyReport; la integridad visible de cada sesión ya está representada por IntegrityBadge; la salud del sistema ya se renderiza en SystemHealthBlock; y el feedback visible se deriva hoy desde logBridge hacia ToastContext. 123486
+
+───
+
+4) Catálogo formal de eventos canónicos
+Ahora definimos qué cambia el estado. Aquí no son métodos; son hechos del sistema.
+4.1 Eventos de sesión
+Estos eventos están respaldados por operaciones reales ya detectadas en DB, geocerca, modales y UI. 1278
+yaml
+SessionEvents:
+  - SESSION_CREATED
+  - SESSION_DESTINATION_SET
+  - SESSION_ARRIVAL_CONFIRMED_MANUAL
+  - SESSION_AUTO_CHECKIN_GPS
+  - SESSION_TRANSIT_STARTED
+  - SESSION_EXIT_DETECTED
+  - SESSION_AUTO_CHECKOUT_GPS
+  - SESSION_CLOSED_MANUAL
+  - SESSION_LUNCH_RECORDED
+  - SESSION_NOTE_ADDED
+  - SESSION_EDITED_MANUAL
+  - SESSION_DELETED_SOFT
+  - SESSION_OVERLAP_DETECTED
+
+4.2 Eventos de sistema
+Estos eventos reflejan permisos, geocerca, background tasks, rehidratación y sincronía operativa. 27
+yaml
+SystemEvents:
+  - APP_BOOT_STARTED
+  - APP_REHYDRATION_COMPLETED
+  - DB_READY
+  - PERMISSIONS_LOCATION_UPDATED
+  - PERMISSIONS_NOTIFICATIONS_UPDATED
+  - GEOFENCE_MONITORING_STARTED
+  - GEOFENCE_MONITORING_STOPPED
+  - BACKGROUND_TASK_REGISTERED
+  - BACKGROUND_TASK_UNREGISTERED
+  - BACKGROUND_TASK_STARTED
+  - BACKGROUND_TASK_FINISHED
+  - SYSTEM_ERROR_RECORDED
+
+4.3 Eventos de reportes
+La generación, compartición y envío existen ya como comportamiento o como simulación explícita a reemplazar. 27
+yaml
+ReportEvents:
+  - REPORT_RANGE_SELECTED
+  - REPORT_GENERATION_STARTED
+  - REPORT_GENERATION_SUCCEEDED
+  - REPORT_GENERATION_FAILED
+  - REPORT_SHARE_REQUESTED
+  - REPORT_EMAIL_REQUESTED
+  - REPORT_MARKED_AS_WEEKLY_DELIVERED
+
+4.4 Eventos de seguridad y feedback
+La validación administrativa y la emisión UX ya están modeladas hoy. 476
+yaml
+SecurityAndFeedbackEvents:
+  - ADMIN_ACCESS_VALIDATION_STARTED
+  - ADMIN_ACCESS_GRANTED
+  - ADMIN_ACCESS_DENIED
+  - ADMIN_ACCESS_LOCKED
+  - FEEDBACK_ENQUEUED
+  - FEEDBACK_DISMISSED
+
+
+───
+
+5) Derivaciones formales
+Aquí definimos lo que no se persiste como verdad primaria, sino que se calcula.
+5.1 Derivaciones por sesión
+Estas ya tienen base directa en payrollUtils, audit_logs, work_sessions e IntegrityBadge. 318
+yaml
+PerSessionDerivations:
+  effectiveDurationMs:
+    source: session.start/end/lunch
+  effectiveHours:
+    source: effectiveDurationMs
+  regularHours:
+    source: calculatePay()
+  overtimeHours:
+    source: calculatePay()
+  totalPay:
+    source: calculatePay()
+  hadAutoCheckin:
+    source: auditLogs.actionType contains AUTO_CHECKIN
+  hadAutoCheckout:
+    source: auditLogs.actionType contains AUTO_CHECKOUT
+  integrityBadge:
+    source:
+      - manual edit
+      - auto checkout
+      - missing/corrupt data
+      - warning conditions
+
+5.2 Derivaciones globales
+Estas alimentan Home, History, Report y Session Detail. 1278
+yaml
+AggregateDerivations:
+  todaySummary:
+    - workedHoursToday
+    - grossPayToday
+  weeklySummary:
+    - totalHours
+    - overtimeHours
+    - totalPay
+    - sessionCount
+  openSession:
+    source: latest non completed/non deleted session
+  currentDestination:
+    source: activeSession.destination
+  historyRows:
+    source: sessions + computed pay + integrity
+  reportPreview:
+    source: settings + weeklySummary + selectedRange
+  sessionDetailView:
+    source: session + audit logs + computed metrics
+
+5.3 Derivaciones de sistema
+Estas ya existen visualmente en SystemHealthBlock, OperationalHeroCard, StatusPill y ToastContext, pero hoy nacen desde estados mock o desde logs. 678
+yaml
+SystemDerivations:
+  currentOperationalState.engineState:
+    source:
+      - activeSession existence
+      - session.domainStatus
+      - geofence.lastExitTimestampMs
+      - audit conditions
+      - permission degradation
+  systemHealth.gpsState:
+    source:
+      - permissions
+      - geofence monitoring
+      - async anomalies
+  systemHealth.syncState:
+    source:
+      - runtime background/report/export flags
+      - critical system log categories
+  feedbackViewModel.nextVisibleFeedback:
+    source:
+      - pendingFeedback queue
+      - dedupe/throttle rules
+
+
+───
+
+6) Regla de oro de normalización: qué se guarda vs qué se deriva
+6.1 Se guarda
+Se guarda lo que representa hechos y configuración. Eso incluye sesiones, settings, logs, permisos relevantes, claves operativas de runtime, estados de seguridad y feedback en cola. Esto es consistente con la DB actual, AsyncStorage, permisos del sistema y estados operativos detectados. 1247
+6.2 Se deriva
+Se deriva lo que representa lecturas de negocio o UX: horas, overtime, pago, badge de integridad, estado operacional visible (engineState), salud del sistema, filas de historial, resumen de reportes y feedback visible actual. Esto ya coincide con cómo hoy la UI consume resúmenes, no tablas crudas. 3786
+
+───
+
+7) Mapeo formal entre el sistema actual y el canónico
+7.1 Lo actual que pasa a domain
+• work_sessions → domain.sessions1
+• settings → domain.settings1
+• audit_logs y system_logs → domain.audit13
+7.2 Lo actual que pasa a runtime
+• LAST_GEOFENCE_EXIT_TIMESTAMP → runtime.geofence.lastExitTimestampMs2
+• LAST_REPORT_WEEK_ID → runtime.background.weeklyReport.lastReportedWeekId2
+• isTaskRunning → runtime.background.appTask.isRunning2
+• isUnlocked / validación admin → runtime.security.adminAccess7
+• FeedbackPayload → runtime.transient.pendingFeedback4
+7.3 Lo actual que deja de vivir en UI
+• engineState local de Home deja de ser fuente de verdad y pasa a ser derivación canónica. 78
+• MOCK_HISTORY deja de existir y pasa a derivarse de domain.sessions + derived.sessionComputed. 7
+• session/[id] deja de usar datos fijos y pasa a leer selectedSessionId + sessionDetailView. 7
+• report.tsx deja de usar setTimeout como verdad y pasa a leer runtime.background.weeklyReport + derived.weeklySummary. 72
+
+───
+
+8) Decisión estructural clave
+La decisión más importante del dump es esta:
+engineState no se persiste como verdad primaria.
+Se deriva de:
+▪ existencia o no de sesión activa,
+▪ domainStatus,
+▪ timestamps de salida,
+▪ anomalías de llegada/salida,
+▪ permisos y condiciones del sistema. 2178
+Eso evita duplicar la realidad entre backend y UI.
+
+───
+
+9) Resultado final
+Con este dump ya tienes, correctamente separados:
+• estado → domain, runtime, views
+• eventos → SessionEvents, SystemEvents, ReportEvents, SecurityAndFeedbackEvents
+• derivaciones → PerSessionDerivations, AggregateDerivations, SystemDerivations
+• sistema → permisos, geocerca, background, seguridad, notificaciones, boot, feedback runtime
+
+───

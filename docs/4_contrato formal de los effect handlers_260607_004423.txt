@@ -1,0 +1,684 @@
+A continuación entrego el contrato formal de los effect handlers, alineado 1:1 con el reducer ya definido, y estrictamente basado en los componentes reales del sistema que hoy existen en db.ts, BackgroundTasks.ts, LocationManager.ts, Notifications.ts, ReportGenerator.ts, logger.ts, logBridge.ts, settings.tsx, RootLayout y la UI de WTracker. 123456
+
+───
+
+1) Principio del contrato de effect handlers
+El reducer muta estado.
+Los effect handlers ejecutan infraestructura.
+Eso significa que todo acceso a:
+• SQLite (runAsync, getFirstAsync, getAllAsync) 1
+• Geocerca / ubicación (startGeofencingAsync, stopGeofencingAsync, permisos) 2
+• Background task (registerTaskAsync, unregisterTaskAsync) 2
+• Notificaciones (scheduleNotificationAsync, canales Android) 2
+• PDF / sharing / email (Print.printToFileAsync, Sharing.shareAsync, MailComposer.composeAsync) 2
+• Logging / auditoría (log, logAudit) 3
+• Feedback UX (emitFeedbackFromLog, ToastContext) 47
+debe vivir fuera del reducer. 1234
+
+───
+
+2) Forma del contrato
+2.1 Definición canónica
+ts
+type EffectHandler = (
+  event: DomainEvent,
+  prevState: WorkTrackerCanonicalState,
+  nextState: WorkTrackerCanonicalState,
+  runtime: EffectRuntime
+) => Promise<DomainEvent[]>;
+
+2.2 Reglas obligatorias
+1. No muta estado directamente. El estado ya viene mutado por el reducer. 15
+2. Puede leer prevState y nextState. Esto es necesario porque varios comportamientos del sistema dependen de transición y no solo de estado final, por ejemplo salida detectada → auto checkout, o generar reporte → compartir. Eso ya ocurre hoy como flujo encadenado en geocerca, background tasks y reportes. 2
+3. Devuelve nuevos eventos, no estado. Esto respeta la arquitectura evento → reducer → efectos → nuevos eventos.
+4. Debe ser idempotente cuando aplique. Esto es especialmente importante en background tasks y registro de tareas, porque hoy ya existe un mutex para evitar concurrencia del SO. 2
+5. No contiene render UI. El render sigue en ToastContext, modales y pantallas. 756
+
+───
+
+3) Runtime formal que reciben los effect handlers
+ts
+EffectRuntime:
+  persistence:
+    sessionStore
+    settingsStore
+    auditStore
+    systemLogStore
+
+  location:
+    requestPermissions
+    startMonitoringArrival
+    stopMonitoring
+
+  notifications:
+    setupNotifications
+    scheduleImmediate
+    scheduleDailyReminder
+    cancelAll
+
+  background:
+    register
+    unregister
+
+  reports:
+    generateWeeklyReport
+    sendReportByEmail
+    shareReport
+
+  security:
+    validateAdminPin
+    secureStoreRead
+    secureStoreWrite
+
+  feedback:
+    enqueueFeedback
+
+  logging:
+    logSystem
+    logAudit
+
+  clock:
+    nowMs
+    nowWeekId
+
+Base real del runtime
+Ese runtime es una abstracción directa de lo que hoy ya existe:
+• insertWorkSession, updateSessionEndTime, saveSettings, deleteWorkSession, getAllAsync, getFirstAsync en DB. 1
+• LocationService.requestPermissions(), startMonitoringArrival(), stopMonitoring(). 2
+• setupNotifications(), scheduleDailyReminder(), cancelNotifications(), scheduleNotificationAsync(). 2
+• BackgroundTasks.register() / unregister(). 2
+• generateWeeklyReport() y sendReportByEmail(). 2
+• log(), logAudit() y bridge UX. 34
+
+───
+
+4) Contrato formal por dominio
+
+───
+
+4.1 Effect handlers de sesión
+EH-01 — handleSessionCreated
+Dispara en
+• SESSION_CREATED16
+Responsabilidades
+1. Persistir la nueva sesión en SQLite usando la semántica de insertWorkSession(). 1
+2. Registrar auditoría de creación manual. insertWorkSession() ya genera logAudit() con acción manual. 13
+3. Si la sesión incluye destino/ubicación objetivo, iniciar monitoreo de geocerca con LocationService.startMonitoringArrival(). 21
+4. Emitir feedback de éxito si corresponde. Hoy Home muestra “Monitoreo protegido activado” al confirmar setup. 5
+Salida esperada
+Puede devolver:
+• GEOFENCE_MONITORING_STARTED
+• AUDIT_LOG_APPENDED
+• FEEDBACK_ENQUEUED
+• SYSTEM_LOG_APPENDED2134
+
+───
+
+EH-02 — handleSessionDestinationSet
+Dispara en
+• SESSION_DESTINATION_SET16
+Responsabilidades
+1. Persistir actualización de destino si el modelo final decide materializarla como update de sesión. La tabla work_sessions ya contiene address, client_name, target_latitude, target_longitude, setup_latitude, setup_longitude. 1
+2. Si el destino cambia en sesión activa, reiniciar monitoreo sobre la nueva región. Esto es consistente con startMonitoringArrival() que sobrescribe geocerca existente sin detenerla primero. 2
+Salida esperada
+• GEOFENCE_MONITORING_STARTED
+• SYSTEM_LOG_APPENDED
+
+───
+
+EH-03 — handleSessionTransitStarted
+Dispara en
+• SESSION_TRANSIT_STARTED356
+Responsabilidades
+1. Registrar auditoría del cambio operacional a tránsito si así se decide en el engine final. La base de acciones auditables manuales ya existe. 31
+2. Reconfigurar geocerca para el nuevo destino cuando aplique. 2
+Salida esperada
+• AUDIT_LOG_APPENDED
+• GEOFENCE_MONITORING_STARTED
+• SYSTEM_LOG_APPENDED
+
+───
+
+EH-04 — handleSessionArrivalConfirmedManual
+Dispara en
+• SESSION_ARRIVAL_CONFIRMED_MANUAL56
+Responsabilidades
+1. Persistir el cambio a actual_start_time y estado active en DB. Hoy el cambio equivalente se hace en LocationManager.ts para auto check-in; el flujo manual deberá escribir el mismo tipo de verdad persistida. 21
+2. Registrar auditoría manual de llegada declarada. AUDIT_ACTIONS.MANUAL ya existe. 31
+3. Limpiar LAST_GEOFENCE_EXIT_TIMESTAMP si estaba activo. La limpieza de esa clave ya ocurre en auto check-in y stop monitoring. 2
+4. Emitir feedback/notification si el producto lo decide. 54
+Salida esperada
+• AUDIT_LOG_APPENDED
+• SYSTEM_LOG_APPENDED
+• FEEDBACK_ENQUEUED
+
+───
+
+EH-05 — handleSessionAutoCheckinGps
+Dispara en
+• SESSION_AUTO_CHECKIN_GPS2
+Responsabilidades
+1. Persistir status = active y actual_start_time = now como hoy ya hace el callback de geocerca. 2
+2. Insertar auditoría AUTO_CHECKIN_GPS. 2
+3. Eliminar LAST_GEOFENCE_EXIT_TIMESTAMP. 2
+4. Programar notificación “Llegaste al sitio”. 2
+5. Registrar log operacional de éxito. 23
+Salida esperada
+• AUDIT_LOG_APPENDED
+• SYSTEM_LOG_APPENDED
+• FEEDBACK_ENQUEUED
+
+───
+
+EH-06 — handleSessionExitDetected
+Dispara en
+• SESSION_EXIT_DETECTED2
+Responsabilidades
+1. Persistir la marca efímera de salida (LAST_GEOFENCE_EXIT_TIMESTAMP) en almacenamiento runtime. Hoy eso se hace en AsyncStorage.setItem(EXIT_TIMESTAMP_KEY, now.toString()). 2
+2. Insertar auditoría GEOFENCE_EXIT. 2
+3. Programar notificación inmediata con acción CHECKOUT_DECISION. 2
+4. Registrar log de evento de geocerca. 23
+Salida esperada
+• AUDIT_LOG_APPENDED
+• SYSTEM_LOG_APPENDED
+• FEEDBACK_ENQUEUED
+
+───
+
+EH-07 — handleSessionExitResolvedContinue
+Dispara en
+• SESSION_EXIT_RESOLVED_CONTINUE56
+Responsabilidades
+1. Eliminar LAST_GEOFENCE_EXIT_TIMESTAMP para cancelar el failsafe pendiente. Esto es coherente con cómo el sistema limpia la clave en auto check-in y stop monitoring. 2
+2. Registrar log/feedback de restauración operativa. En Home hoy se usa “Operación restaurada”. 5
+Salida esperada
+• SYSTEM_LOG_APPENDED
+• FEEDBACK_ENQUEUED
+
+───
+
+EH-08 — handleSessionAutoCheckoutGps
+Dispara en
+• SESSION_AUTO_CHECKOUT_GPS21
+Responsabilidades
+1. Persistir end_time y status = completed usando la semántica de updateSessionEndTime(). 1
+2. Insertar auditoría AUTO_CHECKOUT_GPS. 2
+3. Detener monitoreo con LocationService.stopMonitoring(). 2
+4. Programar notificación de jornada finalizada automáticamente. 2
+5. Registrar log de advertencia/operación automática. 23
+Salida esperada
+• GEOFENCE_MONITORING_STOPPED
+• AUDIT_LOG_APPENDED
+• SYSTEM_LOG_APPENDED
+• FEEDBACK_ENQUEUED
+
+───
+
+EH-09 — handleSessionClosedManual
+Dispara en
+• SESSION_CLOSED_MANUAL15
+Responsabilidades
+1. Persistir cierre manual con updateSessionEndTime(). 1
+2. Detener monitoreo si la sesión era la activa. stopMonitoring() ya limpia geofence, updates y EXIT_TIMESTAMP_KEY. 2
+3. Registrar auditoría manual de cierre si el diseño final decide diferenciarla del auto checkout. El soporte de acciones manuales ya existe. 31
+4. Emitir feedback de cierre exitoso. La UI ya usa mensajes de cierre/deducción. 5
+Salida esperada
+• GEOFENCE_MONITORING_STOPPED
+• AUDIT_LOG_APPENDED
+• SYSTEM_LOG_APPENDED
+• FEEDBACK_ENQUEUED
+
+───
+
+EH-10 — handleSessionLunchRecorded
+Dispara en
+• SESSION_LUNCH_RECORDED16
+Responsabilidades
+1. Persistir lunch_taken, lunch_start, lunch_end usando updateSessionLunch(). 1
+2. Registrar auditoría de lunch. updateSessionLunch() ya genera audit log manual. 1
+3. Registrar log de sistema si se considera operacionalmente relevante. 3
+Salida esperada
+• AUDIT_LOG_APPENDED
+• SYSTEM_LOG_APPENDED
+
+───
+
+EH-11 — handleSessionNoteAdded
+Dispara en
+• SESSION_NOTE_ADDED15
+Responsabilidades
+1. Persistir manual_note en la sesión si la nota es parte de la verdad de dominio. La columna ya existe en work_sessions. 1
+2. Registrar auditoría manual de la nota si así se define en el dominio final. El sistema actual ya audita cambios manuales. 13
+Salida esperada
+• AUDIT_LOG_APPENDED
+• SYSTEM_LOG_APPENDED
+
+───
+
+EH-12 — handleSessionEditedManual
+Dispara en
+• SESSION_EDITED_MANUAL16
+Responsabilidades
+1. Persistir start_time, end_time, manual_note, is_manual_edit = 1 con updateWorkSessionManual(). 1
+2. Validar traslapes antes de persistir, usando checkSessionOverlap(). Esa validación ya existe en DB. 1
+3. Si hay traslape, no persistir y emitir el evento de error/feedback correspondiente. humanizeMessage() ya contempla “Horario choca con otra sesión”. 41
+4. Registrar auditoría detallada de edición manual. updateWorkSessionManual() ya lo hace. 1
+5. Emitir feedback de éxito o error. session/[id].tsx ya muestra “Registro forense actualizado”. 56
+Salida esperada
+• SESSION_OVERLAP_DETECTED si aplica
+• AUDIT_LOG_APPENDED
+• SYSTEM_LOG_APPENDED
+• FEEDBACK_ENQUEUED
+
+───
+
+EH-13 — handleSessionDeletedSoft
+Dispara en
+• SESSION_DELETED_SOFT16
+Responsabilidades
+1. Persistir status = deleted con deleteWorkSession(). 1
+2. Insertar auditoría de eliminación manual. deleteWorkSession() ya lo hace. 1
+3. Emitir feedback de operación destructiva. En session/[id].tsx ya existe “Registro eliminado del sistema”. 56
+4. Si la sesión era activa, detener monitoreo. Esto no aparece explícito hoy, pero es una consecuencia lógica del contrato canónico alineado con stopMonitoring().
+Salida esperada
+• AUDIT_LOG_APPENDED
+• SYSTEM_LOG_APPENDED
+• FEEDBACK_ENQUEUED
+• GEOFENCE_MONITORING_STOPPED si era la activa
+
+───
+
+4.2 Effect handlers de sistema
+EH-14 — handleAppBootStarted
+Dispara en
+• APP_BOOT_STARTED5
+Responsabilidades
+1. Inicializar DB con initDatabase() / ensureDbReady(). 1
+2. Configurar logger con setLoggerDB(database) para vaciar colas pendientes. 31
+3. Solicitar o reconstruir runtime inicial: settings, sesión abierta, flags runtime (EXIT_TIMESTAMP_KEY, LAST_REPORT_WEEK_ID). Eso ya es consistente con la existencia real de SQLite y AsyncStorage como dos fuentes actuales. 12
+4. Configurar notificaciones si la app así lo requiere en boot. 2
+Salida esperada
+• DB_READY
+• APP_REHYDRATION_COMPLETED
+• PERMISSIONS_NOTIFICATIONS_UPDATED si se consulta
+• SYSTEM_LOG_APPENDED
+
+───
+
+EH-15 — handlePermissionsLocationUpdated
+Dispara en
+• PERMISSIONS_LOCATION_UPDATED25
+Responsabilidades
+1. Registrar log del cambio de permisos. 3
+2. Si los permisos son revocados y había monitoreo activo, detener monitoreo. Esto es consistente con la necesidad operacional reflejada por settings.tsx y SystemHealthBlock, aunque no está automatizado aún en el código actual. 562
+3. Emitir feedback de permisos restaurados o revocados. La UI ya simula ambos. 5
+Salida esperada
+• GEOFENCE_MONITORING_STOPPED si aplica
+• SYSTEM_LOG_APPENDED
+• FEEDBACK_ENQUEUED
+
+───
+
+EH-16 — handlePermissionsNotificationsUpdated
+Dispara en
+• PERMISSIONS_NOTIFICATIONS_UPDATED24
+Responsabilidades
+1. Si la plataforma es Android, asegurar el canal por defecto. ensureAndroidDefaultChannel() ya existe. 2
+2. Registrar advertencia si las notificaciones fueron denegadas. setupNotifications() ya lo hace con log(). 24
+Salida esperada
+• SYSTEM_LOG_APPENDED
+• FEEDBACK_ENQUEUED si se desea exponer al usuario
+
+───
+
+EH-17 — handleBackgroundTaskRegistered
+Dispara en
+• BACKGROUND_TASK_REGISTERED2
+Responsabilidades
+1. Registrar la tarea real mediante BackgroundTasks.register(). 2
+2. Registrar log de servicios activos. 23
+Salida esperada
+• SYSTEM_LOG_APPENDED
+
+───
+
+EH-18 — handleBackgroundTaskUnregistered
+Dispara en
+• BACKGROUND_TASK_UNREGISTERED2
+Responsabilidades
+1. Desregistrar la tarea real mediante BackgroundTasks.unregister(). 2
+2. Registrar log de monitoreo detenido. 24
+Salida esperada
+• SYSTEM_LOG_APPENDED
+
+───
+
+EH-19 — handleBackgroundTaskStarted
+Dispara en
+• BACKGROUND_TASK_STARTED2
+Responsabilidades
+1. Registrar log de inicio. 23
+2. Ejecutar dos subprocesos ya existentes en el sistema: 
+◦ revisión de failsafe de salida prolongada
+◦ revisión de ventana semanal de reporte. 2
+Salida esperada
+Puede devolver, según resultado:
+• SESSION_AUTO_CHECKOUT_GPS
+• REPORT_GENERATION_STARTED
+• SYSTEM_LOG_APPENDED
+
+───
+
+EH-20 — handleBackgroundTaskFinished
+Dispara en
+• BACKGROUND_TASK_FINISHED2
+Responsabilidades
+1. Registrar log de finalización con o sin trabajo útil. Hoy el background task ya diferencia ambos casos. 23
+Salida esperada
+• SYSTEM_LOG_APPENDED
+
+───
+
+4.3 Effect handlers de reportes
+EH-21 — handleReportRangeSelected
+Dispara en
+• REPORT_RANGE_SELECTED25
+Responsabilidades
+1. No requiere IO obligatorio.
+2. Opcionalmente puede registrar analítica o log operativo.
+Salida esperada
+• SYSTEM_LOG_APPENDED opcional
+
+───
+
+EH-22 — handleReportGenerationStarted
+Dispara en
+• REPORT_GENERATION_STARTED25
+Responsabilidades
+1. Ejecutar generateWeeklyReport(shouldShare, customRange) con el rango actual. 2
+2. Si no hay settings, registrar error; ReportGenerator.ts ya devuelve null y loguea error crítico. 21
+3. Si el resultado es exitoso, devolver REPORT_GENERATION_SUCCEEDED.
+4. Si falla, devolver REPORT_GENERATION_FAILED.
+Salida esperada
+• REPORT_GENERATION_SUCCEEDED
+• REPORT_GENERATION_FAILED
+• SYSTEM_LOG_APPENDED
+
+───
+
+EH-23 — handleReportGenerationSucceeded
+Dispara en
+• REPORT_GENERATION_SUCCEEDED25
+Responsabilidades
+1. Registrar log de reporte generado. 23
+2. Si la generación fue automática semanal, programar notificación “Reporte Semanal Listo” y marcar semana reportada. Eso ya existe en BackgroundTasks.ts. 2
+3. Si shouldShareAfterGenerate está activo, invocar sharing.
+4. Si shouldSendByEmailAfterGenerate está activo, invocar email.
+Salida esperada
+• REPORT_MARKED_AS_WEEKLY_DELIVERED si aplica
+• SYSTEM_LOG_APPENDED
+• FEEDBACK_ENQUEUED
+
+───
+
+EH-24 — handleReportGenerationFailed
+Dispara en
+• REPORT_GENERATION_FAILED24
+Responsabilidades
+1. Registrar log crítico. ReportGenerator.ts ya registra “Fallo al generar el reporte PDF semanal”. 23
+2. Emitir feedback humanizado. humanizeMessage() ya contempla “No pudimos generar el reporte automático.” 4
+Salida esperada
+• SYSTEM_LOG_APPENDED
+• FEEDBACK_ENQUEUED
+
+───
+
+EH-25 — handleReportShareRequested
+Dispara en
+• REPORT_SHARE_REQUESTED25
+Responsabilidades
+1. Si ya existe lastGeneratedUri, ejecutar Sharing.shareAsync(uri). 2
+2. Si aún no existe PDF, dejar marcada la intención para ser resuelta por handleReportGenerationSucceeded.
+3. Registrar feedback / log. 53
+Salida esperada
+• SYSTEM_LOG_APPENDED
+• FEEDBACK_ENQUEUED
+
+───
+
+EH-26 — handleReportEmailRequested
+Dispara en
+• REPORT_EMAIL_REQUESTED25
+Responsabilidades
+1. Si ya existe lastGeneratedUri, ejecutar sendReportByEmail(pdfUri, settings). 21
+2. Si no existe PDF, dejar marcada la intención para resolución posterior por handleReportGenerationSucceeded.
+3. Registrar log / feedback.
+Salida esperada
+• SYSTEM_LOG_APPENDED
+• FEEDBACK_ENQUEUED
+
+───
+
+4.4 Effect handlers de seguridad
+EH-27 — handleAdminAccessValidationStarted
+Dispara en
+• ADMIN_ACCESS_VALIDATION_STARTED5
+Responsabilidades
+1. Ejecutar validación del PIN usando la infraestructura segura definitiva.
+2. En el prototipo actual la validación usa Crypto.digestStringAsync y comparación con hash hardcodeado; tu documento de deuda técnica ya definió que esto debe migrarse a SecureStore. 5
+3. Devolver: 
+◦ ADMIN_ACCESS_GRANTED
+◦ o ADMIN_ACCESS_DENIED
+Salida esperada
+• ADMIN_ACCESS_GRANTED
+• ADMIN_ACCESS_DENIED
+• SYSTEM_LOG_APPENDED
+
+───
+
+EH-28 — handleAdminAccessGranted
+Dispara en
+• ADMIN_ACCESS_GRANTED54
+Responsabilidades
+1. Registrar log operativo / auditoría si se desea trazar acceso administrativo.
+2. Emitir feedback “Zona administrativa desbloqueada”. La humanización ya existe. 45
+Salida esperada
+• SYSTEM_LOG_APPENDED
+• FEEDBACK_ENQUEUED
+
+───
+
+EH-29 — handleAdminAccessDenied
+Dispara en
+• ADMIN_ACCESS_DENIED54
+Responsabilidades
+1. Registrar intento fallido si la política final lo exige. humanizeMessage() ya contempla “Intento de acceso administrativo fallido”. 4
+2. Emitir feedback de denegación. 54
+Salida esperada
+• SYSTEM_LOG_APPENDED
+• FEEDBACK_ENQUEUED
+
+───
+
+EH-30 — handleAdminAccessLocked
+Dispara en
+• ADMIN_ACCESS_LOCKED5
+Responsabilidades
+1. Registrar log informativo de bloqueo del panel.
+2. Emitir feedback de panel asegurado. 5
+Salida esperada
+• SYSTEM_LOG_APPENDED
+• FEEDBACK_ENQUEUED
+
+───
+
+4.5 Effect handlers de feedback y logs
+EH-31 — handleFeedbackEnqueued
+Dispara en
+• FEEDBACK_ENQUEUED47
+Responsabilidades
+1. Entregar el payload al consumidor visual. Hoy el consumidor real es ToastContext, que acepta showToast(message, type); el bridge de logs ya resuelve visibilidad, tono y deduplicación antes de emitir. 47
+2. Si en el futuro existe diálogo, enrutar según kind = dialog. logBridge.ts ya contempla ambos kind. 4
+Salida esperada
+• Ningún evento obligatorio
+• opcionalmente FEEDBACK_DISMISSED al cerrarse automáticamente
+
+───
+
+EH-32 — handleSystemLogAppended
+Dispara en
+• SYSTEM_LOG_APPENDED31
+Responsabilidades
+1. Persistir en system_logs mediante la misma semántica de saveSystemLogToDb(). 31
+2. Reinyectar el bridge UX si esa categoría/severidad debe producir feedback visible. Hoy log() ya llama emitFeedbackFromLog(). 34
+Salida esperada
+• FEEDBACK_ENQUEUED si corresponde
+
+───
+
+EH-33 — handleAuditLogAppended
+Dispara en
+• AUDIT_LOG_APPENDED31
+Responsabilidades
+1. Persistir en audit_logs mediante la misma semántica de saveAuditToDb(). 31
+2. No produce feedback visible por defecto, salvo que alguna política posterior lo defina.
+Salida esperada
+• Ningún evento obligatorio
+
+───
+
+5) Matriz 1:1 evento → effect handler principal
+yaml
+APP_BOOT_STARTED:
+  handler: handleAppBootStarted
+
+PERMISSIONS_LOCATION_UPDATED:
+  handler: handlePermissionsLocationUpdated
+
+PERMISSIONS_NOTIFICATIONS_UPDATED:
+  handler: handlePermissionsNotificationsUpdated
+
+GEOFENCE_MONITORING_STARTED:
+  handler: [infra already executed by caller OR no-op logging handler]
+
+GEOFENCE_MONITORING_STOPPED:
+  handler: [infra already executed by caller OR no-op logging handler]
+
+BACKGROUND_TASK_REGISTERED:
+  handler: handleBackgroundTaskRegistered
+
+BACKGROUND_TASK_UNREGISTERED:
+  handler: handleBackgroundTaskUnregistered
+
+BACKGROUND_TASK_STARTED:
+  handler: handleBackgroundTaskStarted
+
+BACKGROUND_TASK_FINISHED:
+  handler: handleBackgroundTaskFinished
+
+SESSION_CREATED:
+  handler: handleSessionCreated
+
+SESSION_DESTINATION_SET:
+  handler: handleSessionDestinationSet
+
+SESSION_TRANSIT_STARTED:
+  handler: handleSessionTransitStarted
+
+SESSION_ARRIVAL_CONFIRMED_MANUAL:
+  handler: handleSessionArrivalConfirmedManual
+
+SESSION_AUTO_CHECKIN_GPS:
+  handler: handleSessionAutoCheckinGps
+
+SESSION_EXIT_DETECTED:
+  handler: handleSessionExitDetected
+
+SESSION_EXIT_RESOLVED_CONTINUE:
+  handler: handleSessionExitResolvedContinue
+
+SESSION_AUTO_CHECKOUT_GPS:
+  handler: handleSessionAutoCheckoutGps
+
+SESSION_CLOSED_MANUAL:
+  handler: handleSessionClosedManual
+
+SESSION_LUNCH_RECORDED:
+  handler: handleSessionLunchRecorded
+
+SESSION_NOTE_ADDED:
+  handler: handleSessionNoteAdded
+
+SESSION_EDITED_MANUAL:
+  handler: handleSessionEditedManual
+
+SESSION_DELETED_SOFT:
+  handler: handleSessionDeletedSoft
+
+REPORT_RANGE_SELECTED:
+  handler: handleReportRangeSelected
+
+REPORT_GENERATION_STARTED:
+  handler: handleReportGenerationStarted
+
+REPORT_GENERATION_SUCCEEDED:
+  handler: handleReportGenerationSucceeded
+
+REPORT_GENERATION_FAILED:
+  handler: handleReportGenerationFailed
+
+REPORT_MARKED_AS_WEEKLY_DELIVERED:
+  handler: [no-op or persistence marker handler]
+
+REPORT_SHARE_REQUESTED:
+  handler: handleReportShareRequested
+
+REPORT_EMAIL_REQUESTED:
+  handler: handleReportEmailRequested
+
+ADMIN_ACCESS_VALIDATION_STARTED:
+  handler: handleAdminAccessValidationStarted
+
+ADMIN_ACCESS_GRANTED:
+  handler: handleAdminAccessGranted
+
+ADMIN_ACCESS_DENIED:
+  handler: handleAdminAccessDenied
+
+ADMIN_ACCESS_LOCKED:
+  handler: handleAdminAccessLocked
+
+FEEDBACK_ENQUEUED:
+  handler: handleFeedbackEnqueued
+
+SYSTEM_LOG_APPENDED:
+  handler: handleSystemLogAppended
+
+AUDIT_LOG_APPENDED:
+  handler: handleAuditLogAppended
+
+La necesidad de esta matriz 1:1 sale directamente del reducer formal que acabamos de cerrar y de la separación real entre estado, infraestructura y UI que existe hoy en tus archivos. 123456
+
+───
+
+6) Regla de orquestación final
+Cada dispatch debe ejecutar en este orden:
+a. validateEvent
+b. reducer
+c. effectHandler(event, prevState, nextState, runtime)
+d. dispatch de eventos secundarios devueltos por el handler
+Eso es exactamente lo que necesitas para que:
+• DB, geocerca, notificaciones, PDF y email dejen de estar mezclados con la UI 21
+• engineState deje de vivir en useState y pase a ser derivado del estado canónico 56
+• el sistema de feedback deje de depender de acoplamientos implícitos entre logger y UI y pase a una cola formal de runtime. 347
+
+───
+
+Resultado
+Con este contrato ya tienes definido, a nivel producción y alineado con tu reducer:
+• qué efecto hace cada evento
+• qué infraestructura toca
+• qué eventos secundarios puede emitir
+• qué queda estrictamente fuera del reducer
+
+───

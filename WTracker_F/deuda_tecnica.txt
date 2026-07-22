@@ -1,0 +1,365 @@
+---
+
+# 🔴 NIVEL 1 — CRÍTICO (debe corregirse sí o sí)
+
+## 1. ❌ Uso de `any` (TIPADO ROTO)
+
+### Dónde lo tienes:
+- `WorkSession = any`
+- `AppSettings = any`
+- `AuditLog = any`
+
+### Problema:
+- Pierdes completamente el beneficio de TypeScript
+- Oculta bugs reales
+
+### Qué hacer:
+✅ Crear tipos reales alineados con:
+```
+core/contracts/types.ts
+```
+
+---
+
+## 2. ❌ Sistema de tipos duplicado (ROOT ISSUE)
+
+### Situación:
+- ❌ `src/types.ts` eliminado
+- ✅ `core/contracts/types.ts` activo
+- ⚠️ Código parcialmente migrado
+
+### Problema:
+- Mezcla de modelos → inconsistencia
+- riesgo de bugs en runtime
+
+### Acción:
+✅ Unificar TODO en:
+```
+src/core/contracts/types.ts
+```
+
+---
+
+## 3. ❌ Props “hardcodeadas” en UI (MUY IMPORTANTE)
+
+### Ejemplo actual:
+```tsx
+<OperationalHeroCard
+  state={'NO_INICIADA'}
+  timeString={'--:--'}
+  earnings={'$0.00'}
+/>
+```
+
+### Problema:
+- UI desconectada del estado real
+- rompe lógica de negocio
+
+### Acción:
+✅ Conectar con:
+```ts
+WorkTrackerCanonicalState
+```
+
+---
+
+## 4. ❌ Mock de `expo-sqlite` (TEST HACK)
+
+### Situación actual:
+```ts
+jest.mock('expo-sqlite', ...)
+```
+
+### Problema:
+- Test no valida integración real
+- oculta errores de DB
+
+### Mejor práctica:
+✅ usar mock estructurado o librería dedicada  
+(ej: `expo-sqlite-mock`) [2](https://github.com/zfben/expo-sqlite-mock)  
+
+---
+
+# 🟠 NIVEL 2 — IMPORTANTE (arquitectura)
+
+## 5. ❌ Engine incompleto (subscribe/unsubscribe eliminados)
+
+### Problema:
+- Hook preparado para observer pattern
+- Engine no lo soporta
+
+### Acción:
+👉 Opción A (correcta):
+```ts
+subscribe(listener)
+unsubscribe(listener)
+```
+
+👉 Opción B:
+Eliminar patrón completamente
+
+---
+
+## 6. ❌ Effects con lógica mezclada
+
+Actualmente:
+- lógica de negocio
+- retry logic
+- logging
+- feedback
+
+👉 TODO en un solo archivo
+
+### Problema:
+- difícil de mantener
+- rompe SRP
+
+### Acción:
+Separar:
+```
+effects/
+ ├── handlers/
+ ├── retry/
+ ├── logging/
+ └── executeEffects.ts
+```
+
+---
+
+## 7. ❌ Logging duplicado
+
+Tienes:
+- `logger.ts`
+- `loggingAdapter.ts`
+
+### Problema:
+- doble responsabilidad
+- inconsistencia
+
+### Acción:
+✅ unificar en:
+```
+loggingAdapter → core
+logger → wrapper
+```
+
+---
+
+## 8. ❌ Adapter acoplado a DB
+
+```ts
+sessionStoreAdapter → SQLite directo
+```
+
+### Problema:
+- difícil testear
+- rompe clean architecture
+
+### Acción:
+✅ inyectar DB como dependencia
+
+---
+
+# 🟡 NIVEL 3 — CALIDAD (no urgente pero clave)
+
+## 9. ❌ tsconfig relajado
+
+Actualmente:
+```json
+"noUnusedLocals": false
+```
+
+### Problema:
+- código muerto no detectado
+
+### Acción:
+✅ volver a:
+```json
+true
+```
+
+---
+
+## 10. ❌ Animaciones con fallback artificial
+
+```ts
+springConfig.damping ?? 20
+```
+
+### Problema:
+- valores mágicos
+- comportamiento inconsistente
+
+### Acción:
+✅ definir defaults en:
+```
+constants/animations.ts
+```
+
+---
+
+## 11. ❌ Props eliminadas (no corregidas)
+
+Ejemplo:
+```tsx
+engineState eliminado
+```
+
+### Problema:
+- funcionalidad perdida
+
+### Acción:
+✅ reintroducir correctamente con tipos
+
+---
+
+## 12. ❌ Lógica de UI simplificada artificialmente
+
+Ejemplo:
+```tsx
+onConfirm={() => handleLunchConfirm(true, 30)}
+```
+
+### Problema:
+- comportamiento incorrecto
+
+### Acción:
+✅ restaurar flujo real
+
+---
+
+# 🔵 NIVEL 4 — TESTING
+
+## 13. ❌ Tests sin cobertura real de efectos
+
+Actualmente:
+- effects.test ✅
+- engine.test ✅
+
+Pero:
+
+❌ no validan:
+- retry real
+- logging real
+- DB real
+
+---
+
+## 14. ❌ No hay tests de integración
+
+Falta:
+
+- engine + effects + adapter juntos
+- flujo completo
+
+---
+
+## 15. ❌ No hay tests de UI
+
+Nada para:
+- modals
+- botones
+- navegación
+
+---
+
+# 🟢 NIVEL 5 — PRODUCCIÓN
+
+## 16. ❌ Sin configuración real de Jest/Expo
+
+Deberías usar:
+
+```json
+"preset": "jest-expo"
+```
+
+👉 recomendado por Expo [3](https://docs.expo.dev/develop/unit-testing/)  
+
+---
+
+## 17. ❌ Variables hardcodeadas
+
+Ejemplo:
+```ts
+'$0.00'
+```
+
+### Problema:
+- no dinámico
+- rompe UX
+
+---
+
+## 18. ❌ Sin manejo global de errores
+
+Falta:
+- captura global
+- fallback UI
+
+---
+
+## 19. ❌ Sin separación de entornos
+
+No hay:
+- dev
+- staging
+- prod
+
+👉 crítico en RN [4](https://dev.to/iamsaadmehmood/from-mvp-to-production-a-react-native-checklist-5982)  
+
+---
+
+# 🧩 RESUMEN TOTAL
+
+## 🔴 CRÍTICO (hacer primero)
+- eliminar `any`
+- unificar tipos
+- reconectar UI con estado real
+- mejorar mock DB
+
+---
+
+## 🟠 ARQUITECTURA
+- implementar observer en engine
+- dividir effects
+- desacoplar adapters
+
+---
+
+## 🟡 CALIDAD
+- restaurar strict TS
+- limpiar props
+- eliminar hacks
+
+---
+
+## 🔵 TESTING
+- agregar integración
+- mejorar mocks
+- cubrir effects reales
+
+---
+
+## 🟢 PRODUCCIÓN
+- configurar jest-expo
+- manejar errores globales
+- separar entornos
+
+---
+
+# 🧠 CONCLUSIÓN REAL
+
+Ahora mismo tu proyecto está en:
+
+```
+✅ FUNCIONAL
+⚠️ NO PRODUCTION-READY
+```
+
+Pero estás MUY cerca de:
+
+```
+✅ PRODUCTION-GRADE
+```
+
+---

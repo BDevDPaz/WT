@@ -1,0 +1,531 @@
+A continuación entrego la tabla formal de transiciones en formato de especificación, completa, y separada en cuatro dominios operativos:
+1. Transiciones de jornada / sesión
+2. Transiciones de sistema
+3. Transiciones de reportes
+4. Transiciones de seguridad y feedback
+La tabla está construida como modelo canónico propuesto, pero anclado estrictamente en los comportamientos y estados que sí existen hoy en tus archivos analizados: estados de work_sessions, geocerca, background task, auditoría, settings, feedback, UI state y mocks detectados. 123456
+
+───
+
+1) Convención formal de cada transición
+Cada transición se define con esta estructura:
+• Evento
+• Origen
+• Precondiciones
+• Mutación canónica
+• Side-effects del sistema
+• Derivaciones afectadas
+• Estado operacional visible resultante (engineState)
+El engineState visible de UI se trata aquí como derivación, no como verdad primaria persistida, porque en el sistema actual los estados persistidos reales viven en work_sessions.status, mientras que la UI usa EngineState como simulación visual. 156
+
+───
+
+2) Tabla formal de transiciones — Jornada / Sesión
+T-01 — Inicio de jornada declarada
+• Evento:SESSION_CREATED16
+• Origen: acción del usuario desde DailySetupModal / creación de sesión en DB. 561
+• Precondiciones: no debe existir otra sesión abierta con estado no completed y no deleted; el sistema ya tiene helper getOpenSession() y verificación de traslape checkSessionOverlap(). 1
+• Mutación canónica:
+◦ crear nueva entidad domain.sessions.byId[sessionId]
+◦ setear declaredStartAtMs = start_time
+◦ setear actualStartAtMs = null
+◦ setear lifecycle.domainStatus = pending_arrival o travel, según la intención operacional seleccionada por UI; ambos estados ya existen en el sistema actual. 123
+◦ persistir destination.address, destination.clientName, coordenadas objetivo si ya existen. 1
+◦ actualizar domain.sessions.activeSessionId = sessionId. 1
+• Side-effects del sistema: insertar audit_log de creación manual y, si aplica, preparar monitoreo de geocerca mediante Location.startGeofencingAsync. 12
+• Derivaciones afectadas:openSession, historyRows, currentDestination, systemHealth, feedbackViewModel. 156
+• Estado operacional visible resultante:ESPERANDO_LLEGADA o EN_TRASLADO, porque la UI ya distingue explícitamente ambos estados. 563
+
+───
+
+T-02 — Inicio de monitoreo de llegada
+• Evento:GEOFENCE_MONITORING_STARTED2
+• Origen:LocationService.startMonitoringArrival(lat, lng, radius). 2
+• Precondiciones: permisos foreground y background concedidos; requestPermissions() exige ambos. 2
+• Mutación canónica:
+◦ runtime.geofence.isMonitoring = true
+◦ runtime.geofence.monitoredRegion = { identifier: "WORK_ZONE", latitude, longitude, radiusMeters }
+◦ runtime.permissions.locationForeground = granted y runtime.permissions.locationBackground = granted si ya fueron aprobados. 2
+• Side-effects del sistema: arranque de geocerca nativa y warm-up de GPS con getCurrentPositionAsync. 2
+• Derivaciones afectadas:systemHealth.gpsState, currentOperationalState.engineState, feedback operativo de inicio de monitoreo. 267
+• Estado operacional visible resultante:ESPERANDO_LLEGADA o EN_TRASLADO, según la sesión activa. 562
+
+───
+
+T-03 — Inicio de traslado explícito
+• Evento:SESSION_TRANSIT_STARTED35
+• Origen: botón / flujo de UI que representa “nuevo destino” o “moving”; la UI ya modela EN_TRASLADO y el i18n tiene status_transit / status_travel. 356
+• Precondiciones: debe existir una sesión activa abierta o una jornada que cambia de destino. 15
+• Mutación canónica:
+◦ domain.sessions.activeSessionId permanece igual
+◦ lifecycle.domainStatus = travel
+◦ actualizar destination si el destino cambia. 21
+• Side-effects del sistema: reconfiguración de geocerca para el nuevo punto de destino. 2
+• Derivaciones afectadas:currentDestination, currentOperationalState.engineState, SessionTimeline. 56
+• Estado operacional visible resultante:EN_TRASLADO. 56
+
+───
+
+T-04 — Auto check-in por GPS
+• Evento:SESSION_AUTO_CHECKIN_GPS2
+• Origen: callback de geocerca Enter en LocationManager.ts. 2
+• Precondiciones: la última sesión debe existir y estar en pending_arrival o travel. 2
+• Mutación canónica:
+◦ actualStartAtMs = now
+◦ lifecycle.domainStatus = active
+◦ limpiar runtime.geofence.lastExitTimestampMs = null. 2
+• Side-effects del sistema: insertar audit_log con AUTO_CHECKIN_GPS, eliminar la clave LAST_GEOFENCE_EXIT_TIMESTAMP, notificación “Llegaste al sitio”. 2
+• Derivaciones afectadas:sessionComputed.hadAutoCheckin, todaySummary, systemHealth, feedbackViewModel, SessionTimeline, IntegrityBadge. 216
+• Estado operacional visible resultante:ACTIVA. 562
+
+───
+
+T-05 — Confirmación manual de llegada
+• Evento:SESSION_ARRIVAL_CONFIRMED_MANUAL56
+• Origen: flujo de UI “Forzar Llegada” / “Declarar Llegada” presente en OperationalHeroCard y index.tsx. 56
+• Precondiciones: sesión abierta en estado de espera o asincronía de llegada. 56
+• Mutación canónica propuesta:
+◦ actualStartAtMs = now si estaba vacío
+◦ lifecycle.domainStatus = active
+◦ lifecycle.isManualEdit = true solo si la confirmación manual se considera corrección; si es una llegada declarativa normal, no marca edición manual. Esta última parte es decisión de diseño propuesta, no está explicitada en el código actual. 156
+• Side-effects del sistema: registrar auditoría manual de llegada declarada. El sistema actual ya audita acciones manuales con AUDIT_ACTIONS.MANUAL. 13
+• Derivaciones afectadas:sessionComputed, historyRows, SessionTimeline, currentOperationalState.engineState. 16
+• Estado operacional visible resultante:ACTIVA. 56
+
+───
+
+T-06 — Detección de salida de zona protegida
+• Evento:SESSION_EXIT_DETECTED2
+• Origen: callback de geocerca Exit. 2
+• Precondiciones: la sesión más reciente debe existir y estar active. 2
+• Mutación canónica:
+◦ runtime.geofence.lastExitTimestampMs = now
+◦ el domainStatus puede seguir en active, porque el sistema actual no cierra inmediatamente; solo arranca el temporizador de inactividad. 2
+• Side-effects del sistema:audit_log con GEOFENCE_EXIT, notificación con acción CHECKOUT_DECISION. 2
+• Derivaciones afectadas:currentOperationalState.engineState, systemHealth.gpsState, feedbackViewModel, ExitDetectionModal candidato. 256
+• Estado operacional visible resultante:SALIDA_DETECTADA. 562
+
+───
+
+T-07 — Restauración operativa tras salida detectada
+• Evento:SESSION_EXIT_RESOLVED_CONTINUE56
+• Origen: botón “Continuar” en ExitDetectionModal y flujo “Operación restaurada” en Home. 56
+• Precondiciones: debe existir una salida detectada pendiente. 26
+• Mutación canónica propuesta:
+◦ runtime.geofence.lastExitTimestampMs = null
+◦ mantener lifecycle.domainStatus = active. La limpieza explícita del timestamp al continuar no aparece hoy en la UI mock, pero es consistente con la lógica de AsyncStorage.removeItem(EXIT_TIMESTAMP_KEY) que ya ocurre en auto check-in y stop monitoring. 256
+• Side-effects del sistema: feedback “Operación restaurada”. 5
+• Derivaciones afectadas:currentOperationalState.engineState, systemHealth, pendingFeedback. 56
+• Estado operacional visible resultante:ACTIVA. 56
+
+───
+
+T-08 — Auto check-out por inactividad prolongada
+• Evento:SESSION_AUTO_CHECKOUT_GPS21
+• Origen: background task en BackgroundTasks.ts. 2
+• Precondiciones:
+◦ debe existir runtime.geofence.lastExitTimestampMs válido
+◦ la diferencia contra now debe superar 15 * 60 * 1000
+◦ la sesión más reciente debe seguir active. 2
+• Mutación canónica:
+◦ endAtMs = exitTime
+◦ lifecycle.domainStatus = completed
+◦ domain.sessions.activeSessionId = null. La función updateSessionEndTime() marca explícitamente status = 'completed'. 12
+• Side-effects del sistema:
+◦ audit_logAUTO_CHECKOUT_GPS
+◦ detener monitoreo LocationService.stopMonitoring()
+◦ notificación de cierre automático. 2
+• Derivaciones afectadas:sessionComputed.hadAutoCheckout, weeklySummary, historyRows, IntegrityBadge, reportPreview, currentOperationalState.engineState. 216
+• Estado operacional visible resultante:CERRADA. 561
+
+───
+
+T-09 — Cierre manual de jornada
+• Evento:SESSION_CLOSED_MANUAL156
+• Origen: flujo de usuario “Cerrar Jornada”, eventualmente seguido de LunchModal; en DB existe updateSessionEndTime(id, endTime). 156
+• Precondiciones: debe existir sesión activa abierta. 1
+• Mutación canónica:
+◦ endAtMs = selectedEndTime
+◦ lifecycle.domainStatus = completed
+◦ domain.sessions.activeSessionId = null. 1
+• Side-effects del sistema: auditoría de cierre y posible detención de monitoreo. La base ya registra cierre mediante updateSessionEndTime; la parada de monitoreo es consistente con LocationService.stopMonitoring(). 12
+• Derivaciones afectadas:todaySummary, weeklySummary, historyRows, reportPreview, currentOperationalState.engineState. 156
+• Estado operacional visible resultante:CERRADA. 56
+
+───
+
+T-10 — Registro de lunch / deducción de descanso
+• Evento:SESSION_LUNCH_RECORDED16
+• Origen:LunchModal y updateSessionLunch(id, start, end). 561
+• Precondiciones: la sesión debe existir. 1
+• Mutación canónica:
+◦ lunch.taken = true
+◦ lunch.startAtMs, lunch.endAtMs si existen
+◦ lunch.deductedMinutes derivado de esos tiempos o de un valor seleccionado en UI; el sistema actual soporta ambos patrones porque calculateSessionDuration() descuenta exacto si hay timestamps y una hora por defecto si solo lunchTaken es verdadero. 136
+• Side-effects del sistema: auditoría manual de lunch. 1
+• Derivaciones afectadas:effectiveDurationMs, effectiveHours, grossPay, weeklySummary, reportPreview. 32
+• Estado operacional visible resultante: si ya fue cerrada, CERRADA; si lunch ocurre durante sesión abierta y luego se continúa, el estado visible sigue dependiendo del domainStatus. La UI mock usa lunch como paso previo al cierre final. 56
+
+───
+
+T-11 — Nota agregada a la sesión
+• Evento:SESSION_NOTE_ADDED15
+• Origen: acción secundaria “Añadir Nota” y campo manual_note en DB. 51
+• Precondiciones: sesión existente. 1
+• Mutación canónica:notes.manualNote = text. 1
+• Side-effects del sistema: auditoría manual si se trata de modificación persistida; la DB ya audita acciones manuales. 13
+• Derivaciones afectadas:historyRows, reportPreview, sessionDetailView. 256
+• Estado operacional visible resultante: no cambia por sí mismo. 56
+
+───
+
+T-12 — Edición manual de registro
+• Evento:SESSION_EDITED_MANUAL156
+• Origen:EditSessionModal y updateWorkSessionManual(id, startTime, endTime, note). 61
+• Precondiciones:
+◦ sesión existente
+◦ motivo de ajuste obligatorio en UI
+◦ idealmente sin corrupción activa si el formulario está validando. La UI bloquea “Guardar” si detecta datos corruptos o si la nota está vacía. 6
+• Mutación canónica:
+◦ declaredStartAtMs = startTime
+◦ endAtMs = endTime
+◦ notes.manualNote = note
+◦ lifecycle.isManualEdit = true. 16
+• Side-effects del sistema: auditoría manual detallada con los nuevos tiempos y motivo. 1
+• Derivaciones afectadas:effectiveDurationMs, pay, integrityBadge, historyRows, reportPreview, sessionDetailView. 136
+• Estado operacional visible resultante: si la sesión ya estaba cerrada, normalmente sigue CERRADA; el cambio principal es la integridad (manual). 61
+
+───
+
+T-13 — Eliminación lógica de sesión
+• Evento:SESSION_DELETED_SOFT16
+• Origen:DeleteSessionModal y deleteWorkSession(id). 61
+• Precondiciones: sesión existente. 1
+• Mutación canónica:
+◦ lifecycle.domainStatus = deleted
+◦ lifecycle.isDeleted = true
+◦ si era la activa, activeSessionId = null. La DB ya hace status = 'deleted'. 1
+• Side-effects del sistema: auditoría de eliminación manual. 1
+• Derivaciones afectadas: exclusión de historial útil, exclusión de resúmenes, exclusión de reportes; checkSessionOverlap() y getWeeklyStats() ya excluyen deleted. 1
+• Estado operacional visible resultante: si elimina una sesión cerrada, no afecta engineState global; si elimina la sesión activa, pasa a NO_INICIADA. Esta última parte es una consecuencia propuesta consistente con el modelo. 15
+
+───
+
+T-14 — Detección de traslape
+• Evento:SESSION_OVERLAP_DETECTED13
+• Origen:checkSessionOverlap(start, end, excludeId). 1
+• Precondiciones: intento de guardar una edición o sesión que intersecta otra no eliminada. 1
+• Mutación canónica propuesta: no muta domain.sessions; agrega error de validación de dominio y feedback visible. El sistema actual ya humaniza “Horario choca con otra sesión”. 41
+• Side-effects del sistema: auditoría o feedback de advertencia. AUDIT_ACTIONS.OVERLAP existe ya en logger.ts, aunque no vemos aún su invocación desde otro módulo en los archivos analizados. 3
+• Derivaciones afectadas:pendingFeedback, validación de formularios, sessionDetailView. 46
+• Estado operacional visible resultante: no cambia la jornada; cambia el estado de validación de la operación. 16
+
+───
+
+3) Tabla formal de transiciones — Sistema
+T-15 — Inicio de boot de aplicación
+• Evento:APP_BOOT_STARTED5
+• Origen: montaje de RootLayout. 5
+• Precondiciones: ninguna. 5
+• Mutación canónica:
+◦ meta.bootState.isRehydrating = true
+◦ runtime.background.appTask.isRunning = false inicialmente
+◦ preparar lectura de persistencia. La UI ya muestra un overlay de rehidratación de sesión segura. 56
+• Side-effects del sistema: mostrar LoadingOverlay. 56
+• Derivaciones afectadas: disponibilidad de navegación y render inicial. 5
+• Estado operacional visible resultante: overlay de carga; aún sin engineState definitivo. 56
+
+───
+
+T-16 — Finalización de rehidratación
+• Evento:APP_REHYDRATION_COMPLETED5
+• Origen: fin del guardián de rehidratación en RootLayout. 5
+• Precondiciones: boot en curso. 5
+• Mutación canónica:
+◦ meta.bootState.isRehydrating = false
+◦ meta.bootState.lastHydratedAtMs = now. El timestamp exacto es propuesta canónica; el código actual no lo persiste, pero sí materializa el fin del boot. 5
+• Side-effects del sistema: ocultar LoadingOverlay. 56
+• Derivaciones afectadas:currentOperationalState.engineState ya puede resolverse con el estado activo. 51
+• Estado operacional visible resultante: el que corresponda según sesión activa, permisos y runtime. 15
+
+───
+
+T-17 — DB lista para operar
+• Evento:DB_READY13
+• Origen:initDatabase() / ensureDbReady() / setLoggerDB(database). 13
+• Precondiciones: inicialización de SQLite completada, PRAGMAs configurados, tablas creadas. 1
+• Mutación canónica:
+◦ sistema marca base lista
+◦ flush de logQueue y auditQueue de logger.ts. 31
+• Side-effects del sistema: inserción de settings por defecto si no existen. 1
+• Derivaciones afectadas:systemHealth.syncState, disponibilidad de repositorios y reportes. 13
+• Estado operacional visible resultante: no cambia por sí mismo, pero habilita toda la operación. 1
+
+───
+
+T-18 — Actualización de permisos de ubicación
+• Evento:PERMISSIONS_LOCATION_UPDATED25
+• Origen:LocationService.requestPermissions() o simulador de permisos en settings.tsx. 25
+• Precondiciones: solicitud o reevaluación del SO. 25
+• Mutación canónica:
+◦ actualizar runtime.permissions.locationForeground
+◦ actualizar runtime.permissions.locationBackground. 2
+• Side-effects del sistema: feedback de permisos restaurados o revocados; la UI actual simula ambos mensajes. 5
+• Derivaciones afectadas:systemHealth.gpsState, currentOperationalState.engineState, elegibilidad para monitoreo. 26
+• Estado operacional visible resultante: si los permisos se degradan durante operación, la UI actual ya usa señales de error/advertencia; por tanto el estado puede caer en degradación equivalente a ASINCRONIA_CHECKIN o a un modo de error sistémico derivado. Esto último es propuesta de mapeo canónico, porque el código no implementa aún esa transición automática completa. 562
+
+───
+
+T-19 — Actualización de permisos de notificaciones
+• Evento:PERMISSIONS_NOTIFICATIONS_UPDATED24
+• Origen:setupNotifications(). 2
+• Precondiciones: solicitud o revisión del permiso. 2
+• Mutación canónica:runtime.permissions.notifications = granted | denied. 2
+• Side-effects del sistema: si es Android, asegurar canal default; si se deniega, registrar advertencia. 24
+• Derivaciones afectadas: capacidad efectiva del sistema para alertas automáticas. 24
+• Estado operacional visible resultante: no cambia la jornada, pero sí el health operativo. 2
+
+───
+
+T-20 — Registro del background task
+• Evento:BACKGROUND_TASK_REGISTERED2
+• Origen:BackgroundTasks.register(). 2
+• Precondiciones: SO no restringido y tarea no registrada previamente. 2
+• Mutación canónica:
+◦ runtime.background.appTask.isRegistered = true
+◦ runtime.background.appTask.taskName = APP_BACKGROUND_SERVICES. 2
+• Side-effects del sistema: log de servicios de fondo registrados. 23
+• Derivaciones afectadas:systemHealth.syncState, capacidad de failsafe y reporte automático. 2
+• Estado operacional visible resultante: no cambia la jornada. 2
+
+───
+
+T-21 — Inicio de ejecución del background task
+• Evento:BACKGROUND_TASK_STARTED2
+• Origen: callback TaskManager.defineTask(TASK_NAME, async () => ...). 2
+• Precondiciones: tarea registrada y mutex libre (isTaskRunning === false). 2
+• Mutación canónica:runtime.background.appTask.isRunning = true. 2
+• Side-effects del sistema: log de “Tarea iniciada por el sistema”. Si el mutex está bloqueado, la ejecución se omite sin mutar trabajo útil. 23
+• Derivaciones afectadas:systemHealth.syncState. 2
+• Estado operacional visible resultante: no cambia directamente la jornada. 2
+
+───
+
+T-22 — Finalización del background task
+• Evento:BACKGROUND_TASK_FINISHED2
+• Origen: bloque finally del task. 2
+• Precondiciones: task ejecutándose. 2
+• Mutación canónica:runtime.background.appTask.isRunning = false. 2
+• Side-effects del sistema: resultado Success o Failed, logs de “con trabajo útil” o “sin cambios”. 23
+• Derivaciones afectadas:systemHealth.syncState. 2
+• Estado operacional visible resultante: no cambia la jornada. 2
+
+───
+
+T-23 — Detención de monitoreo
+• Evento:GEOFENCE_MONITORING_STOPPED2
+• Origen:LocationService.stopMonitoring(). 2
+• Precondiciones: geocerca o actualizaciones activas. 2
+• Mutación canónica:
+◦ runtime.geofence.isMonitoring = false
+◦ runtime.geofence.lastExitTimestampMs = null
+◦ limpiar región monitoreada si así se decide en la implementación canónica. La limpieza explícita completa de la región no está hoy en el código, pero sí se detienen geofence, location updates y la clave de salida. 2
+• Side-effects del sistema: log MONITOREO_DETENIDO. 24
+• Derivaciones afectadas:systemHealth.gpsState, currentOperationalState.engineState. 26
+• Estado operacional visible resultante: si no hay sesión abierta, NO_INICIADA o CERRADA según corresponda. 15
+
+───
+
+4) Tabla formal de transiciones — Reportes
+T-24 — Selección de rango de reporte
+• Evento:REPORT_RANGE_SELECTED25
+• Origen: selector temporal de report.tsx o generación automática del rango semanal en background. 52
+• Precondiciones: ninguna. 52
+• Mutación canónica:views.report.selectedRange = { startAtMs, endAtMs, label }. 52
+• Side-effects del sistema: ninguno obligatorio. 5
+• Derivaciones afectadas:weeklySummary, reportPreview, DocumentPreviewWidget. 256
+• Estado operacional visible resultante: no cambia la jornada. 5
+
+───
+
+T-25 — Inicio de generación de reporte
+• Evento:REPORT_GENERATION_STARTED25
+• Origen:generateWeeklyReport() o acción “Generar reporte” de la UI. 25
+• Precondiciones:settings disponibles; ReportGenerator.ts devuelve null si no encuentra settings. 21
+• Mutación canónica:
+◦ runtime.background.weeklyReport.generationStatus = generating
+◦ limpiar lastGeneratedUri si se quiere tratar como nueva corrida. Esto último es decisión de implementación propuesta. 25
+• Side-effects del sistema: lectura de sesiones y audit logs por rango, cálculo de horas y pay, construcción HTML, impresión a PDF. 231
+• Derivaciones afectadas:reportPreview, feedbackViewModel, UI de botones export/share. 256
+• Estado operacional visible resultante: no cambia la jornada, pero sí el estado de exportación de la vista de reportes. 5
+
+───
+
+T-26 — Generación de reporte exitosa
+• Evento:REPORT_GENERATION_SUCCEEDED25
+• Origen:generateWeeklyReport() retorna uri. 2
+• Precondiciones: el PDF se generó correctamente. 2
+• Mutación canónica:
+◦ runtime.background.weeklyReport.generationStatus = generated
+◦ runtime.background.weeklyReport.lastGeneratedUri = uri. 2
+• Side-effects del sistema: si el trigger es automático semanal, emitir notificación de reporte listo y guardar lastReportedWeekId. 2
+• Derivaciones afectadas: habilitación de “Compartir”, “Enviar por correo”, “Previsualizar”, feedback de éxito. 56
+• Estado operacional visible resultante: sin cambio de jornada. 5
+
+───
+
+T-27 — Fallo de generación de reporte
+• Evento:REPORT_GENERATION_FAILED245
+• Origen: error interno de generateWeeklyReport() o simulación de fallo en UI. 25
+• Precondiciones: intento de generación iniciado. 25
+• Mutación canónica:runtime.background.weeklyReport.generationStatus = failed. 25
+• Side-effects del sistema: log crítico / feedback al usuario; humanizeMessage() ya contempla “Error en Reporte”. 42
+• Derivaciones afectadas:pendingFeedback, bloqueo de acciones posteriores dependientes del PDF. 57
+• Estado operacional visible resultante: sin cambio de jornada. 5
+
+───
+
+T-28 — Marcado de semana reportada
+• Evento:REPORT_MARKED_AS_WEEKLY_DELIVERED2
+• Origen: background task semanal después de generar reporte correctamente. 2
+• Precondiciones:lastReportedWeekId !== currentWeekId y PDF generado. 2
+• Mutación canónica:runtime.background.weeklyReport.lastReportedWeekId = currentWeekId. 2
+• Side-effects del sistema: evita reprocesar la misma semana. 2
+• Derivaciones afectadas: elegibilidad del reporte automático. 2
+• Estado operacional visible resultante: sin cambio de jornada. 2
+
+───
+
+T-29 — Solicitud de compartir reporte
+• Evento:REPORT_SHARE_REQUESTED25
+• Origen: botón “Compartir” o Sharing.shareAsync(uri) dentro de generateWeeklyReport(true). 25
+• Precondiciones:lastGeneratedUri presente. 25
+• Mutación canónica propuesta:runtime.transient.exportIntent.shouldShareAfterGenerate = true si la solicitud ocurre antes de generar; si ocurre después, no necesita mutación persistente de dominio. 25
+• Side-effects del sistema: abrir menú nativo de compartir. 25
+• Derivaciones afectadas: feedback transitorio de exportación. 57
+• Estado operacional visible resultante: sin cambio de jornada. 5
+
+───
+
+T-30 — Solicitud de envío por correo
+• Evento:REPORT_EMAIL_REQUESTED25
+• Origen:sendReportByEmail(pdfUri, settings) o botón “Enviar por correo”. 25
+• Precondiciones:pdfUri válido y settings.companyEmail disponible para flujo de correo directo. 21
+• Mutación canónica propuesta:runtime.transient.exportIntent.shouldSendByEmailAfterGenerate = true cuando la intención se registra antes de tener el PDF. 25
+• Side-effects del sistema: abrir MailComposer.composeAsync o fallback a Sharing.shareAsync. 2
+• Derivaciones afectadas: feedback de exportación / UI de reporte. 25
+• Estado operacional visible resultante: sin cambio de jornada. 2
+
+───
+
+5) Tabla formal de transiciones — Seguridad y feedback
+T-31 — Inicio de validación de acceso administrativo
+• Evento:ADMIN_ACCESS_VALIDATION_STARTED5
+• Origen:handleUnlock() en settings.tsx. 5
+• Precondiciones: el PIN no debe estar vacío. 5
+• Mutación canónica:runtime.security.adminAccess.validationStatus = validating. 5
+• Side-effects del sistema: ejecutar validación async del PIN. La UI actual usa verifyAdminPinSecurely() con hash demo. 5
+• Derivaciones afectadas: bloqueo/desbloqueo visual de parámetros de jornada. 5
+• Estado operacional visible resultante: no cambia la jornada; cambia el estado del panel administrativo. 5
+
+───
+
+T-32 — Acceso administrativo concedido
+• Evento:ADMIN_ACCESS_GRANTED54
+• Origen: validación exitosa del PIN. 5
+• Precondiciones: el hash del PIN coincide. 5
+• Mutación canónica:
+◦ runtime.security.adminAccess.isUnlocked = true
+◦ runtime.security.adminAccess.validationStatus = granted
+◦ runtime.security.adminAccess.lastValidatedAtMs = now. El timestamp exacto es propuesta canónica. 5
+• Side-effects del sistema: feedback “Zona administrativa desbloqueada”; humanizeMessage() ya contempla esta cadena. 54
+• Derivaciones afectadas: habilitación de inputs protegidos. 5
+• Estado operacional visible resultante: sin cambio de jornada. 5
+
+───
+
+T-33 — Acceso administrativo denegado
+• Evento:ADMIN_ACCESS_DENIED54
+• Origen: validación fallida del PIN. 5
+• Precondiciones: intento de desbloqueo ejecutado. 5
+• Mutación canónica:
+◦ runtime.security.adminAccess.isUnlocked = false
+◦ runtime.security.adminAccess.validationStatus = denied. 5
+• Side-effects del sistema: feedback “PIN incorrecto. Acceso denegado.”; humanizeMessage() ya contempla contraseña administrativa incorrecta. 54
+• Derivaciones afectadas: bloqueo persistente del panel. 5
+• Estado operacional visible resultante: sin cambio de jornada. 5
+
+───
+
+T-34 — Bloqueo manual del panel administrativo
+• Evento:ADMIN_ACCESS_LOCKED5
+• Origen:handleLock(). 5
+• Precondiciones: panel desbloqueado. 5
+• Mutación canónica:
+◦ runtime.security.adminAccess.isUnlocked = false
+◦ runtime.security.adminAccess.validationStatus = idle. 5
+• Side-effects del sistema: feedback de panel bloqueado. 5
+• Derivaciones afectadas: inputs protegidos vuelven a modo locked. 5
+• Estado operacional visible resultante: sin cambio de jornada. 5
+
+───
+
+T-35 — Encolado de feedback UX
+• Evento:FEEDBACK_ENQUEUED47
+• Origen:emitFeedbackFromLog() o acciones directas de UI que hoy llaman showToast(). 457
+• Precondiciones: el payload no debe ser filtrado por reglas de visibilidad y no debe caer en throttling. logBridge.ts ya define ambas reglas. 4
+• Mutación canónica: agregar elemento a runtime.transient.pendingFeedback[] con kind, tone, title, message, dedupeKey, durationMs, destructive. 4
+• Side-effects del sistema: render de toast o diálogo según consumidor visual. ToastContext.tsx ya renderiza el toast usando showToast(message, type). 74
+• Derivaciones afectadas:feedbackViewModel.nextVisibleFeedback. 47
+• Estado operacional visible resultante: sin cambio de jornada. 4
+
+───
+
+T-36 — Dismiss de feedback UX
+• Evento:FEEDBACK_DISMISSED7
+• Origen: final de temporizador del toast o cierre del consumidor visual. ToastContext hoy descarta mensaje tras 3500 ms. 7
+• Precondiciones: debe existir un feedback visible. 74
+• Mutación canónica: remover el feedback consumido de runtime.transient.pendingFeedback[]. 47
+• Side-effects del sistema: animación de salida del toast. 7
+• Derivaciones afectadas:feedbackViewModel.nextVisibleFeedback. 47
+• Estado operacional visible resultante: sin cambio de jornada. 7
+
+───
+
+6) Tabla de resolución del engineState derivado
+Esta tabla no es un evento; es la regla de lectura que convierte el estado canónico en el estado operativo visible que hoy consume la UI. La base observable para esta tabla ya existe en work_sessions.status, EXIT_TIMESTAMP, los estados mock de index.tsx y el EngineState declarado en OperationalHeroCard.tsx. 1256
+R-01 — NO_INICIADA
+Se resuelve cuando activeSessionId = null y no existe sesión abierta válida. 15
+R-02 — ESPERANDO_LLEGADA
+Se resuelve cuando existe sesión activa y domainStatus = pending_arrival, con geocerca monitoreando o esperando check-in. 216
+R-03 — EN_TRASLADO
+Se resuelve cuando existe sesión activa y domainStatus = travel. 236
+R-04 — ACTIVA
+Se resuelve cuando existe sesión activa y domainStatus = active, sin salida pendiente abierta. 216
+R-05 — SALIDA_DETECTADA
+Se resuelve cuando domainStatus = active y runtime.geofence.lastExitTimestampMs tiene valor válido todavía no consumido por auto checkout ni restaurado manualmente. 26
+R-06 — CERRADA
+Se resuelve cuando la sesión operativa actual fue marcada completed o cuando ya no existe sesión activa tras un cierre formal. 15
+R-07 — ASINCRONIA_CHECKIN
+Se resuelve como estado derivado de anomalía, no persistido, cuando el sistema espera llegada pero detecta inconsistencia operativa de GPS / sincronía. La UI lo modela explícitamente y SystemHealthBlock ya distingue estados degradados, pero el backend actual aún no persiste esta anomalía como campo dedicado. Por eso aquí queda formalizado como derivación del sistema, no como columna persistida. 562
+R-08 — NO_SHOW
+Se resuelve como estado derivado de excepción operacional cuando una sesión esperada de llegada falla y debe ser abortada o forzada manualmente. La UI lo modela explícitamente, pero el backend actual no lo persiste como status en DB; por eso también queda en la capa derivada, no en la primaria. 561
+
+───
+
+7) Regla de consistencia del sistema
+La tabla completa queda gobernada por esta regla:
+Ningún evento muta directamente engineState; cada evento muta estado canónico primario (domain o runtime) y después las derivaciones recalculan el engineState, el SystemHealth, los badges de integridad, el historial visible y el feedback UX.12346
+
+───
+
+8) Resultado
+Con esta tabla ya tienes formalizados, en orden y sin ambigüedad:
+• todos los eventos relevantes
+• las precondiciones
+• la mutación canónica
+• los side-effects
+• las derivaciones impactadas
+• y el estado visible resultante
+
+───

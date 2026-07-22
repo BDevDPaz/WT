@@ -1,0 +1,381 @@
+S continuación entrego solo el plan de implementación fase por fase, listo para ejecución técnica.
+Base factual del plan
+ Hoy tu sistema tiene:
+▪ una base real en SQLite con work_sessions, settings, audit_logs y system_logs, además de helpers de creación, cierre, lunch, edición manual, borrado lógico, overlap y sesión abierta; también usa WAL, foreign_keys y una configuración inicial por defecto. 12
+▪ servicios reales para geocerca, background task, notificaciones y generación de reportes PDF/correo/compartir. 3
+▪ utilidades reales para zona horaria fija America/Los_Angeles, cálculo de duración, horas extra y pago. 2
+▪ una UI WTracker ya desacoplada de infraestructura, pero todavía alimentada por estado local/mock (engineState, MOCK_HISTORY, reportes simulados y seguridad provisional). 456
+
+───
+
+Plan de implementación por fases
+Fase 0 — Preparación estructural del repositorio
+Objetivo
+Crear el espacio técnico donde vivirá el engine canónico sin tocar todavía la UI productiva.
+Trabajo a ejecutar
+• Crear el nuevo módulo interno del engine dentro de WTracker, con carpetas separadas para: 
+◦ core/state
+◦ core/reducer
+◦ core/effects
+◦ core/selectors
+◦ core/runtime
+◦ core/contracts
+• Congelar el uso de nuevos mocks en UI.
+• Mantener intactos app/, src/components/, src/constants/ y src/context/ToastContext.tsx, porque ya son una base visual reusable. 7645
+Entregables
+• Estructura de carpetas del engine.
+• Tipos raíz del estado canónico, eventos y contratos.
+• Punto único de entrada: workTrackerEngine.
+Criterio de salida
+Existe un módulo compilable, sin integración aún con la UI.
+
+───
+
+Fase 1 — Implementación del sessionStore real
+Objetivo
+Encapsular completamente db.ts detrás del adapter sessionStore, sin cambiar todavía el comportamiento funcional.
+Trabajo a ejecutar
+• Implementar sessionStore.initialize() sobre la misma lógica actual de SQLite: 
+◦ apertura única,
+◦ PRAGMAs,
+◦ creación de tablas,
+◦ settings por defecto. 1
+• Implementar métodos equivalentes a: 
+◦ getSettings
+◦ saveSettings
+◦ createSession
+◦ updateSessionDestination
+◦ markSessionActive
+◦ closeSession
+◦ recordLunch
+◦ updateSessionManual
+◦ softDeleteSession
+◦ getOpenSession
+◦ getSessionById
+◦ getSessionsInRange
+◦ getAllSessions
+◦ checkOverlap
+◦ getWeeklyStats
+◦ appendAuditLog
+◦ appendSystemLog. 12
+Entregables
+• SessionStoreAdapter implementado.
+• Tests de compatibilidad contra el esquema actual de DB.
+Criterio de salida
+Todo lo que hoy hace db.ts ya puede ser llamado exclusivamente vía sessionStore.
+
+───
+
+Fase 2 — Implementación del adapter logging
+Objetivo
+Separar observabilidad de la lógica de dominio y quitar la dependencia implícita entre logger.ts y UI.
+Trabajo a ejecutar
+• Implementar: 
+◦ appendSystemLog
+◦ appendAuditLog
+◦ mapLogToFeedback
+• Mantener compatibilidad con: 
+◦ categorías,
+◦ severidades,
+◦ serialización de metadata,
+◦ colas hasta que DB esté lista,
+◦ humanización,
+◦ dedupe/throttling lógico del feedback. 28
+• El bridge de feedback debe devolver FeedbackPayload, no renderizar UX directamente. ToastContext seguirá siendo solo consumidor visual. 86
+Entregables
+• LoggingAdapter implementado.
+• Capa de traducción log → feedback payload.
+Criterio de salida
+logger.ts y logBridge.ts quedan reemplazables por el adapter sin pérdida funcional.
+
+───
+
+Fase 3 — Implementación del adapter location
+Objetivo
+Aislar permisos, geocerca y timestamp de salida fuera del dominio.
+Trabajo a ejecutar
+• Implementar sobre expo-location y AsyncStorage el contrato: 
+◦ requestPermissions
+◦ startMonitoringArrival
+◦ stopMonitoring
+◦ getCurrentPositionWarmup
+◦ saveLastExitTimestamp
+◦ getLastExitTimestamp
+◦ clearLastExitTimestamp. 3
+• Mantener compatibilidad con: 
+◦ GEOFENCE_TRACKING_TASK
+◦ LAST_GEOFENCE_EXIT_TIMESTAMP
+◦ enter/exit de geocerca. 3
+Entregables
+• LocationAdapter implementado.
+• Wrapper único para geofence y almacenamiento runtime de salida.
+Criterio de salida
+LocationManager.ts deja de ser llamado directamente por cualquier otra capa.
+
+───
+
+Fase 4 — Implementación del adapter notifications
+Objetivo
+Concentrar toda la infraestructura de notificaciones en un único punto.
+Trabajo a ejecutar
+• Implementar: 
+◦ requestPermissions
+◦ ensureDefaultChannel
+◦ scheduleImmediate
+◦ scheduleDailyReminder
+◦ cancelAllScheduled
+◦ dismissAllVisible. 3
+• Cubrir los cuatro casos ya existentes: 
+◦ llegada detectada,
+◦ salida del área,
+◦ cierre automático,
+◦ reporte semanal listo. 3
+Entregables
+• NotificationsAdapter implementado.
+• Mapeo unificado de prioridad, sonido y payload de acción.
+Criterio de salida
+Ningún servicio ni pantalla programa notificaciones directamente.
+
+───
+
+Fase 5 — Implementación del adapter reports
+Objetivo
+Separar la generación documental del acceso a datos y del estado UI mock del tab de reportes.
+Trabajo a ejecutar
+• Implementar: 
+◦ generateWeeklyReport
+◦ shareReport
+◦ sendReportByEmail
+ sobre la lógica real ya existente en ReportGenerator.ts. 32
+• Mantener: 
+◦ cálculo con calculateSessionDuration
+◦ cálculo con calculatePay
+◦ detección de AUTO_CHECKOUT desde audit logs
+◦ HTML → PDF
+◦ compartir y correo. 32
+Entregables
+• ReportsAdapter implementado.
+• Reporte real independiente del tab report.tsx.
+Criterio de salida
+El módulo de reportes puede generar un PDF real sin depender del estado local del tab de reportes.
+
+───
+
+Fase 6 — Implementación del adapter security
+Objetivo
+Eliminar la seguridad provisional del frontend y mover la validación administrativa a un adapter real.
+Trabajo a ejecutar
+• Implementar: 
+◦ validateAdminPin
+◦ readAdminSecret
+◦ writeAdminSecret
+• Reemplazar el flujo actual de settings.tsx, donde hoy el hash SHA-256 está embebido en UI y la validación vive localmente. 4
+Entregables
+• SecurityAdapter implementado.
+• Eliminación del secreto hardcodeado del frontend.
+Criterio de salida
+La pantalla de ajustes ya no conoce el mecanismo real de validación.
+
+───
+
+Fase 7 — Implementación del engine: reducer + effect handlers + dispatcher
+Objetivo
+Poner en funcionamiento el núcleo reactivo completo.
+Trabajo a ejecutar
+• Implementar el reducer maestro y sub-reducers ya definidos: 
+◦ sistema
+◦ sesiones
+◦ reportes
+◦ seguridad
+◦ feedback
+◦ logs
+• Implementar los effect handlers 1:1 ya definidos: 
+◦ sesión
+◦ sistema
+◦ reportes
+◦ seguridad
+◦ feedback/logs
+• Implementar el dispatcher: 
+◦ validateEvent
+◦ reducer
+◦ effectHandler
+◦ dispatch de eventos secundarios.
+Entregables
+• Engine ejecutable.
+• Runtime adapter conectado al engine.
+Criterio de salida
+El engine puede ejecutar un flujo completo de sesión sin que la UI conozca DB, geofence ni notificaciones.
+
+───
+
+Fase 8 — Implementación de selectores de producción
+Objetivo
+Proveer a la UI lecturas derivadas estables y reemplazar definitivamente estados mock/locales.
+Trabajo a ejecutar
+• Implementar selectores para: 
+◦ sesión activa
+◦ engineState derivado
+◦ destino actual
+◦ historial
+◦ detalle por sessionId
+◦ resumen diario
+◦ resumen semanal
+◦ preview de reporte
+◦ salud del sistema
+◦ admin access
+◦ feedback visible.
+ Estos selectores deben alimentarse del estado canónico, no de useState. El estado mock visible hoy en Home, History, Report y Session Detail debe desaparecer como verdad de negocio. 45
+Entregables
+• Librería de selectores del engine.
+• Contratos de view model por pantalla.
+Criterio de salida
+La UI ya puede renderizar solo a partir del engine.
+
+───
+
+Fase 9 — Integración UI fase 1: reemplazo del Home (app/(tabs)/index.tsx)
+Objetivo
+Conectar la pantalla más crítica al engine real.
+Trabajo a ejecutar
+• Reemplazar en Home: 
+◦ engineState local,
+◦ currentDestination,
+◦ control mock del flujo principal,
+◦ uso manual de transiciones. 45
+• Conectar: 
+◦ OperationalHeroCard
+◦ DailySummaryBlock
+◦ SystemHealthBlock
+◦ SessionTimeline
+◦ modales
+ mediante selectores + dispatch de eventos. 45
+Entregables
+• Pantalla “Hoy” operando con estado real.
+Criterio de salida
+No queda ningún useState de dominio en index.tsx.
+
+───
+
+Fase 10 — Integración UI fase 2: reemplazo de History y Session Detail
+Objetivo
+Eliminar mocks de historial y detalle de sesión.
+Trabajo a ejecutar
+• Reemplazar MOCK_HISTORY por getHistoryList(state). history.tsx hoy usa datos estáticos y badges mock. 45
+• Reemplazar app/session/[id].tsx para que use el id real de ruta y seleccione la sesión desde el engine, en lugar de renderizar datos estáticos. Tu documento de deuda técnica también marca explícitamente este problema.
+• Conectar EditSessionModal y DeleteSessionModal a eventos reales. 45
+Entregables
+• Historial real.
+• Detalle de sesión real.
+Criterio de salida
+No queda ningún dato estático en History ni en Session Detail.
+
+───
+
+Fase 11 — Integración UI fase 3: reemplazo de Report y Settings
+Objetivo
+Eliminar simulación de exportación y seguridad provisional.
+Trabajo a ejecutar
+• report.tsx: 
+◦ reemplazar isExporting, hasGenerated, forceMemoryError como verdad local por selectores del engine y eventos reales de reportes. Hoy son simulación de setTimeout. 4
+• settings.tsx: 
+◦ reemplazar validación provisional del PIN,
+◦ conectar settings reales persistidos,
+◦ conectar recordatorio diario real,
+◦ conectar permisos reales y estado del sistema. 134
+Entregables
+• Tab de reportes conectado a PDF real.
+• Tab de ajustes conectado a configuración y seguridad reales.
+Criterio de salida
+Desaparecen los estados volátiles de simulación en Report y Settings.
+
+───
+
+Fase 12 — Integración de feedback reactivo
+Objetivo
+Cerrar el circuito evento → log/feedback → UI sin acoplamiento implícito.
+Trabajo a ejecutar
+• Reemplazar cualquier showToast() manual de dominio por emisión de FEEDBACK_ENQUEUED desde effect handlers o desde el adapter de logging.
+• Mantener ToastContext como renderer visual, no como fuente de reglas. 68
+• El componente visual de toast sigue intacto; cambia solo su origen de datos. 6
+Entregables
+• Cola de feedback del engine.
+• Toast renderizado desde estado runtime.
+Criterio de salida
+La UI no decide ya qué feedback mostrar ante eventos del dominio.
+
+───
+
+Fase 13 — Retiro definitivo de deuda técnica controlada
+Objetivo
+Eliminar completamente mocks y estados desconectados ya identificados.
+Trabajo a ejecutar
+• Eliminar: 
+◦ MockDataContext y cualquier uso residual,
+◦ MOCK_HISTORY,
+◦ datos fijos de session/[id],
+◦ simulador de reportes,
+◦ hash demo del PIN en frontend,
+◦ estados de dominio en useState.
+ Tu documento de deuda técnica ya enumeró exactamente esos elementos como deuda controlada.
+• Mantener solo: 
+◦ theme,
+◦ componentes visuales,
+◦ ToastContext,
+◦ navegación. 4765
+Entregables
+• UI libre de mocks de dominio.
+• Dominio con única fuente de verdad.
+Criterio de salida
+La aplicación funciona sin ningún mock operativo.
+
+───
+
+Fase 14 — Hardening y validación final
+Objetivo
+Asegurar estabilidad, rehidratación correcta y consistencia end-to-end.
+Trabajo a ejecutar
+• Verificar: 
+◦ reinicio de app con sesión activa,
+◦ salida detectada + auto checkout,
+◦ edición manual con overlap,
+◦ generación de reporte semanal,
+◦ persistencia de settings,
+◦ validación administrativa,
+◦ funcionamiento de notificaciones y geocerca,
+◦ feedback deduplicado y no ruidoso.
+ Todos estos flujos tienen soporte explícito en los módulos analizados. 312845
+Entregables
+• Checklist de validación técnica.
+• Congelación de la nueva arquitectura.
+Criterio de salida
+El engine reemplaza operativamente al backend disperso sin romper la experiencia visual ya construida.
+
+───
+
+Orden exacto de ejecución recomendado
+Secuencia obligatoria
+1. Fase 0
+2. Fase 1
+3. Fase 2
+4. Fase 3
+5. Fase 4
+6. Fase 5
+7. Fase 6
+8. Fase 7
+9. Fase 8
+10. Fase 9
+11. Fase 10
+12. Fase 11
+13. Fase 12
+14. Fase 13
+15. Fase 14
+
+───
+
+Resultado esperado al final del plan
+Al finalizar este plan, obtendrás:
+• una única fuente de verdad,
+• UI completamente desacoplada de infraestructura,
+• runtime real para SQLite, geocerca, notificaciones, PDF, seguridad y logging,
+• eliminación total de mocks operativos,
+• y continuidad del sistema de diseño y UX que ya está muy avanzado. 13287645

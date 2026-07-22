@@ -1,0 +1,100 @@
+{
+  ".eslintrc.js": [],
+  ".expo/types/router.d.ts": [],
+  "app/(tabs)/_layout.tsx": [
+    "src/constants/theme.ts"
+  ],
+  "app/(tabs)/history.tsx": [
+    "src/components/ui/IntegrityBadge.tsx",
+    "src/constants/theme.ts",
+    "src/context/ToastContext.tsx"
+  ],
+  "app/(tabs)/index.tsx": [
+    "src/components/modals/DailySetupModal.tsx",
+    "src/components/modals/ExitDetectionModal.tsx",
+    "src/components/modals/LunchModal.tsx",
+    "src/components/ui/DailySummaryBlock.tsx",
+    "src/components/ui/OperationalHeroCard.tsx",
+    "src/components/ui/SessionTimeline.tsx",
+    "src/components/ui/SystemHealthBlock.tsx",
+    "src/constants/theme.ts",
+    "src/context/ToastContext.tsx"
+  ],
+  "app/(tabs)/report.tsx": [
+    "src/components/ui/Button.tsx",
+    "src/components/ui/DocumentPreviewWidget.tsx",
+    "src/constants/theme.ts",
+    "src/context/ToastContext.tsx"
+  ],
+  "app/(tabs)/settings.tsx": [
+    "src/components/ui/Button.tsx",
+    "src/constants/theme.ts",
+    "src/context/ToastContext.tsx"
+  ],
+  "app/_layout.tsx": [
+    "src/constants/theme.ts",
+    "src/context/ToastContext.tsx"
+  ],
+  "app/session/[id].tsx": [
+    "src/components/modals/DeleteSessionModal.tsx",
+    "src/components/modals/EditSessionModal.tsx",
+    "src/components/ui/Button.tsx",
+    "src/components/ui/IntegrityBadge.tsx",
+    "src/constants/theme.ts"
+  ],
+  "babel.config.js": [],
+  "expo-env.d.ts": [],
+  "metro.config.js": [],
+  "src/components/modals/DailySetupModal.tsx": [
+    "src/components/ui/Button.tsx",
+    "src/constants/theme.ts"
+  ],
+  "src/components/modals/DeleteSessionModal.tsx": [
+    "src/components/ui/Button.tsx",
+    "src/constants/theme.ts"
+  ],
+  "src/components/modals/EditSessionModal.tsx": [
+    "src/components/ui/Button.tsx",
+    "src/constants/theme.ts"
+  ],
+  "src/components/modals/ExitDetectionModal.tsx": [
+    "src/components/ui/Button.tsx",
+    "src/constants/theme.ts"
+  ],
+  "src/components/modals/LunchModal.tsx": [
+    "src/components/ui/Button.tsx",
+    "src/constants/theme.ts"
+  ],
+  "src/components/ui/Button.tsx": [
+    "src/constants/theme.ts"
+  ],
+  "src/components/ui/DailySummaryBlock.tsx": [
+    "src/constants/theme.ts"
+  ],
+  "src/components/ui/DocumentPreviewWidget.tsx": [
+    "src/constants/theme.ts"
+  ],
+  "src/components/ui/IntegrityBadge.tsx": [
+    "src/constants/theme.ts"
+  ],
+  "src/components/ui/OperationalHeroCard.tsx": [
+    "src/components/ui/Button.tsx",
+    "src/components/ui/StatusPill.tsx",
+    "src/constants/theme.ts"
+  ],
+  "src/components/ui/SessionTimeline.tsx": [
+    "src/components/ui/OperationalHeroCard.tsx",
+    "src/constants/theme.ts"
+  ],
+  "src/components/ui/StatusPill.tsx": [
+    "src/constants/theme.ts"
+  ],
+  "src/components/ui/SystemHealthBlock.tsx": [
+    "src/components/ui/OperationalHeroCard.tsx",
+    "src/constants/theme.ts"
+  ],
+  "src/constants/theme.ts": [],
+  "src/context/ToastContext.tsx": [
+    "src/constants/theme.ts"
+  ]
+}

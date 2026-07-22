@@ -1,0 +1,230 @@
+---
+
+# 🟦 **SIMULACIÓN 1 — Día normal con un solo trabajo**
+
+## 🌅 6:00 AM — Notificación de inicio de jornada
+- El empleado está en su casa.  
+- Recibe la notificación:  
+  **“¿A dónde vas a trabajar hoy?”**
+
+### Acción del empleado:
+Toca la notificación → se abre **DailySetupModal**.
+
+### Acción del sistema:
+- Valida la dirección (online/offline).  
+- Activa geovalla en el sitio.  
+- No crea sesión todavía.  
+- No registra auditoría.  
+
+---
+
+## 🚗 7:00–8:00 AM — Camino al trabajo
+- La app puede estar cerrada.  
+- La geovalla está activa.  
+
+---
+
+## 🟢 8:15 AM — Auto check‑in
+El empleado cruza el radio de 150 m.
+
+### Acción del sistema:
+- Crea sesión activa.  
+- Registra auditoría: **AUTO_ENTRADA**.  
+- Activa tracking.  
+- Envía notificación:  
+  **“Entrada registrada en: [dirección]”**
+
+---
+
+## 🍔 12:00 PM — Notificación de almuerzo
+- Recibe:  
+  **“¿Vas a tomar tu hora de lonche?”**
+
+### Acción del empleado:
+Toca la notificación → se abre **LunchModal**.
+
+### Acción del sistema:
+- Marca almuerzo tomado o no tomado.  
+- Registra auditoría.  
+
+---
+
+## 🏗 3:30 PM — Auto check‑out
+El empleado se aleja más de 3.2 km.
+
+### Acción del sistema:
+- Cierra sesión.  
+- Registra auditoría: **AUTO_SALIDA**.  
+- Envía notificación con `type: 'GEOFENCE_EXIT'`:  
+  **“Salida registrada”**  
+- Apaga tracking.  
+
+### Acción del empleado:
+Toca la notificación → se abre **PostWorkModal**.
+
+### Opciones:
+- **Terminar jornada** → Fin del día.  
+- **Nuevo trabajo** → Se abre DailySetupModal.  
+
+---
+
+## 🌙 Fin del día
+- No hay más sesiones.  
+- Todo queda registrado.  
+
+---
+
+# 🟩 **SIMULACIÓN 2 — Día con dos trabajos**
+
+## 🌅 6:00 AM — Notificación de inicio
+El empleado ingresa dirección del primer trabajo.
+
+---
+
+## 🟢 8:00 AM — Auto check‑in del primer trabajo
+- Auditoría: AUTO_ENTRADA  
+- Tracking activado  
+
+---
+
+## 🍔 12:00 PM — Almuerzo
+- Registra almuerzo  
+- Auditoría  
+
+---
+
+## 🏗 2:00 PM — Auto check‑out del primer trabajo
+- Auditoría: AUTO_SALIDA  
+- Notificación con `GEOFENCE_EXIT`  
+- Tracking apagado  
+
+### Acción del empleado:
+Toca la notificación → se abre **PostWorkModal**.
+
+### Elige:
+**“Nuevo trabajo”**
+
+---
+
+## 📝 2:01 PM — Nuevo trabajo
+- Se abre DailySetupModal  
+- Ingresa nueva dirección  
+- Se activa nueva geovalla  
+
+---
+
+## 🟢 2:45 PM — Auto check‑in del segundo trabajo
+- Auditoría: AUTO_ENTRADA  
+- Tracking activado  
+
+---
+
+## 🏗 5:30 PM — Auto check‑out del segundo trabajo
+- Auditoría: AUTO_SALIDA  
+- Notificación con `GEOFENCE_EXIT`  
+
+### Acción del empleado:
+Toca la notificación → PostWorkModal  
+Elige **“Terminar jornada”**
+
+---
+
+## 🌙 Fin del día
+- Dos sesiones completas  
+- Dos entradas  
+- Dos salidas  
+- Almuerzo registrado  
+- Auditoría completa  
+
+---
+
+# 🟧 **SIMULACIÓN 3 — Día con errores reales (sin internet, GPS débil, dirección incorrecta)**
+
+## 🌅 6:00 AM — Notificación
+El empleado ingresa dirección, pero **no tiene internet**.
+
+### Acción del sistema:
+- No puede geocodificar  
+- Usa GPS actual como fallback  
+- Si GPS también falla → usa `0,0`  
+- Guarda dirección tal cual  
+- Activa geovalla con lo que tenga  
+
+---
+
+## 🚗 8:00 AM — Llega al sitio
+Si la dirección era incorrecta:
+
+### Caso A — GPS funciona
+- Auto check‑in ocurre igual  
+- Reverse geocoding obtiene dirección real  
+- Auditoría: AUTO_ENTRADA  
+
+### Caso B — GPS débil
+- No hay auto check‑in  
+- El empleado abre la app  
+- Toca “Nuevo trabajo”  
+- Ingresa dirección correcta  
+- Se activa geovalla  
+- Auto check‑in ocurre cuando el GPS se estabiliza  
+
+---
+
+## 🍔 12:00 PM — Almuerzo
+Funciona igual aunque no haya internet.
+
+---
+
+## 🏗 3:30 PM — Auto check‑out
+Funciona aunque no haya internet.
+
+---
+
+## 🧳 PostWorkModal
+El empleado decide si:
+
+- Termina jornada  
+- Va a otro trabajo  
+
+---
+
+# 🟪 **SIMULACIÓN 4 — Home Depot → regreso al mismo sitio**
+
+## 🌅 6:00 AM — Dirección del día
+Ingresa dirección del trabajo.
+
+---
+
+## 🟢 8:00 AM — Auto check‑in
+Todo normal.
+
+---
+
+## 🏗 11:00 AM — Se aleja para ir a Home Depot
+Tracking detecta distancia > 3.2 km.
+
+### Acción del sistema:
+- Auto check‑out  
+- Auditoría  
+- Notificación con `GEOFENCE_EXIT`  
+
+### Acción del empleado:
+Toca la notificación → PostWorkModal  
+Elige **“Nuevo trabajo”**  
+Ingresa **la misma dirección**  
+Se activa geovalla nuevamente  
+
+---
+
+## 🟢 11:45 AM — Regresa al sitio
+Auto check‑in nuevamente.
+
+---
+
+## 🏗 3:30 PM — Salida final
+Auto check‑out  
+Notificación  
+PostWorkModal  
+Elige **“Terminar jornada”**
+
+---
