@@ -1110,7 +1110,7 @@ La estrategia óptima es:
 
 ---
 
-# 12. Anexo — resumen corto de la Fase 0 ejecutada
+# 12. Anexo — resumen corto de la Fase 0 ejecutada en la rama copilot/research-ledtracker012926-auto-check
 
 - `src/constants/storageKeys.ts` nuevo
 - `LocationManager.ts` endurecido
