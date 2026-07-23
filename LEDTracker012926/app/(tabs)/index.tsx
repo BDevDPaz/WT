@@ -1,14 +1,13 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { View, Text, StyleSheet, RefreshControl, ScrollView, ActivityIndicator, TouchableOpacity, Alert } from 'react-native'; 
+import { View, Text, StyleSheet, RefreshControl, ScrollView, ActivityIndicator, TouchableOpacity } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useFocusEffect, useLocalSearchParams, useRouter } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
 import * as Location from 'expo-location';
-import * as Notifications from 'expo-notifications';
 import Animated, { useSharedValue, useAnimatedStyle, withRepeat, withTiming, withSequence } from 'react-native-reanimated';
 
 // Imports de Lógica
-import { getDB, insertWorkSession, updateSessionEndTime, getSettings, updateSessionLunch, insertAuditLog } from '../../src/database/db';
+import { getDB, insertWorkSession, updateSessionEndTime, getSettings, updateSessionLunch, insertAuditLog, deleteWorkSession } from '../../src/database/db';
 import { WorkSession } from '../../src/types';
 import { LocationService } from '../../src/services/LocationManager';
 import { calculateSessionDuration, calculatePay } from '../../src/utils/payrollUtils';
@@ -24,7 +23,7 @@ import { formatTime } from '../../src/utils/dateUtils';
 
 export default function HomeScreen() {
   const { t } = useLanguage();
-  const { showToast } = useLuxuryUI();
+  const { showToast, showDialog } = useLuxuryUI();
   const router = useRouter();
   const params = useLocalSearchParams();
 
@@ -50,22 +49,6 @@ export default function HomeScreen() {
       withSequence(withTiming(1.2, { duration: 1000 }), withTiming(1, { duration: 1000 })),
       -1, true
     );
-
-    const subscription = Notifications.addNotificationResponseReceivedListener(async response => {
-      // ✅ FIX: "|| {}" Previene el crash aquí también
-      const data = response.notification.request.content.data || {};
-
-      if (data.action === 'OPEN_DAILY_SETUP') {
-        setSetupMode('start');
-        setShowSetupModal(true);
-      } else if (data.action === 'GENERATE_REPORT_PROMPT') {
-        router.push('/(tabs)/report');
-      } else if (data.action === 'CHECKOUT_DECISION') {
-        triggerCheckoutDecision();
-      }
-    });
-
-    return () => subscription.remove();
   }, []);
 
   // Control de Parámetros (Navegación desde _layout)
@@ -116,7 +99,7 @@ export default function HomeScreen() {
     startOfDay.setHours(0,0,0,0);
 
     const sessions = await db.getAllAsync<WorkSession>(
-      "SELECT * FROM work_sessions WHERE start_time >= ?", [startOfDay.getTime()]
+      "SELECT * FROM work_sessions WHERE start_time >= ? AND status != 'deleted'", [startOfDay.getTime()]
     );
 
     let totalHoursToday = 0;
@@ -153,24 +136,18 @@ export default function HomeScreen() {
   useFocusEffect(useCallback(() => { loadData(); }, []));
 
   const triggerCheckoutDecision = () => {
-    Alert.alert(
-      "📍 Saliste del Área de Trabajo",
-      "¿Terminaste tu jornada o vas a otro sitio?",
-      [
-        { 
-          text: "Otro Trabajo", 
-          onPress: () => {
-             setSetupMode('transit');
-             setShowSetupModal(true);
-          }
-        },
-        { 
-          text: "Terminar Jornada", 
-          style: 'destructive', 
-          onPress: () => handleClockOut() 
-        }
-      ]
-    );
+    showDialog({
+      title: t.alert_exit_title || "📍 Saliste del Área de Trabajo",
+      message: t.alert_exit_msg || "¿Terminaste tu jornada o vas a otro sitio?",
+      confirmText: t.btn_finished || "Terminar Jornada",
+      cancelText: t.btn_moving || "Otro Trabajo",
+      isDestructive: true,
+      onConfirm: () => handleClockOut(),
+      onCancel: () => {
+        setSetupMode('transit');
+        setShowSetupModal(true);
+      },
+    });
   };
 
   const handleSetupSubmit = async (addrInput: string, clientInput: string, notesInput: string) => {
@@ -229,11 +206,11 @@ export default function HomeScreen() {
 
       setShowSetupModal(false);
       await loadData();
-      showToast(setupMode === 'start' ? "Geocerca Activada" : "Tránsito iniciado", "success");
+      showToast(setupMode === 'start' ? (t.toast_geofence_active || "Geocerca Activada") : (t.toast_transit_started || "Tránsito iniciado"), "success");
 
     } catch (error) { 
       console.error(error); 
-      showToast("Error al configurar", "error"); 
+      showToast(t.toast_error_generic || "Error al configurar", "error"); 
     } finally { 
       setIsProcessing(false); 
     }
@@ -269,11 +246,37 @@ export default function HomeScreen() {
        }
        setShowLunchModal(false);
        await loadData();
-       showToast("Jornada finalizada", "success");
+       showToast(t.toast_shift_ended || "Jornada finalizada", "success");
      } catch (e) { 
        console.error(e); 
-       showToast("Error al finalizar", "error"); 
+       showToast(t.toast_error_generic || "Error al finalizar", "error"); 
      } finally { setIsProcessing(false); }
+  };
+
+  const handleCancelPending = () => {
+    if (!activeSession) return;
+
+    showDialog({
+      title: t.btn_cancel || "CANCELAR",
+      message: "¿Desea cancelar el viaje y borrar esta sesión?",
+      confirmText: "SÍ, CANCELAR",
+      isDestructive: true,
+      onConfirm: async () => {
+        setIsProcessing(true);
+        try {
+          await deleteWorkSession(activeSession.id!);
+          await LocationService.stopMonitoring();
+          await insertAuditLog(activeSession.id!, 'CANCEL_TRIP', 'Usuario canceló el trayecto pendiente.');
+          await loadData();
+          showToast(t.toast_shift_ended || "Trayecto cancelado", "success");
+        } catch (e) {
+          console.error(e);
+          showToast(t.toast_error_generic || "Error al cancelar", "error");
+        } finally {
+          setIsProcessing(false);
+        }
+      },
+    });
   };
 
   const getStatusIcon = () => {
@@ -372,6 +375,16 @@ export default function HomeScreen() {
             disabled={isProcessing}
             icon={<Ionicons name={activeSession ? "stop" : "play"} size={18} color={activeSession ? "#FFF" : "#000"} />}
         />
+
+        {activeSession?.status === 'pending_arrival' && (
+          <LuxuryButton
+            text={t.btn_cancel || "CANCELAR TRAYECTO"}
+            variant="outline"
+            onPress={handleCancelPending}
+            disabled={isProcessing}
+            icon={<Ionicons name="close-circle-outline" size={18} color="#AAA" />}
+          />
+        )}
 
         <View style={styles.statsContainer}>
           <View style={styles.statBox}>

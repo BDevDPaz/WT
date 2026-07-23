@@ -2,24 +2,39 @@ import * as Location from 'expo-location';
 import * as TaskManager from 'expo-task-manager';
 import * as Notifications from 'expo-notifications';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { getDB, insertAuditLog } from '../database/db';
+import { getDB, initDatabase, insertAuditLog } from '../database/db';
 import { WorkSession } from '../types';
+import { STORAGE_KEYS } from '../constants/storageKeys';
 
 const GEOFENCE_TASK = 'GEOFENCE_TRACKING_TASK';
 
-// 🟦 VARIABLES DE ESTADO (Según lógica de tu amiga)
-const KEY_LAST_EXIT_AT = 'lastGeofenceExitAt';
-const KEY_LAST_DECISION_AT = 'lastUserDecisionAt';
+const KEY_LAST_EXIT_AT = STORAGE_KEYS.LAST_GEOFENCE_EXIT_AT;
+const KEY_LAST_DECISION_AT = STORAGE_KEYS.LAST_USER_DECISION_AT;
 
 TaskManager.defineTask(GEOFENCE_TASK, async ({ data, error }: any) => {
-  if (error) return;
+  if (error) {
+    console.error('[GEO] Error crítico en tarea:', error);
+    return;
+  }
 
   const { eventType } = data;
-  const db = getDB();
+
+  // Guard: initialise DB if the background task wakes up before the foreground app.
+  let db = getDB();
+  if (!db) {
+    try {
+      await initDatabase();
+      db = getDB();
+    } catch (e) {
+      console.error('[GEO] Fallo al inicializar DB en background:', e);
+      return;
+    }
+  }
+  if (!db) return;
 
   try {
     const session = await db.getFirstAsync<WorkSession>(
-      "SELECT * FROM work_sessions ORDER BY id DESC LIMIT 1"
+      "SELECT * FROM work_sessions WHERE status IN ('pending_arrival', 'travel', 'active') ORDER BY id DESC LIMIT 1"
     );
 
     if (!session) return;
@@ -75,7 +90,7 @@ TaskManager.defineTask(GEOFENCE_TASK, async ({ data, error }: any) => {
       }
     }
   } catch (err) {
-    console.error("Error en geocerca:", err);
+    console.error('[GEO] Error en lógica de geocerca:', err);
   }
 });
 
@@ -89,11 +104,16 @@ export const LocationService = {
 
   startMonitoringArrival: async (lat: number, lng: number, radius: number = 200) => {
     try {
+      if (!lat || !lng) throw new Error('Coordenadas inválidas para la geocerca');
+
       const isRegistered = await TaskManager.isTaskRegisteredAsync(GEOFENCE_TASK);
       if (isRegistered) {
+        console.log('[GEO] Deteniendo tarea previa...');
         try { await Location.stopGeofencingAsync(GEOFENCE_TASK); } catch (e) {}
+        // Allow Android time to clear the previous region from SharedPreferences.
+        await new Promise(resolve => setTimeout(resolve, 1000));
       }
-      await AsyncStorage.removeItem(KEY_LAST_EXIT_AT); // Reiniciar estado
+      await AsyncStorage.removeItem(KEY_LAST_EXIT_AT);
       
       await Location.startGeofencingAsync(GEOFENCE_TASK, [{
         identifier: 'WORK_ZONE', latitude: lat, longitude: lng, radius: radius,
@@ -107,8 +127,10 @@ export const LocationService = {
     try {
       const isRegistered = await TaskManager.isTaskRegisteredAsync(GEOFENCE_TASK);
       if (isRegistered) await Location.stopGeofencingAsync(GEOFENCE_TASK);
-      await AsyncStorage.removeItem(KEY_LAST_EXIT_AT); // 4.1 Resolver temporizador
-    } catch (e) {}
+      await AsyncStorage.removeItem(KEY_LAST_EXIT_AT);
+    } catch (e) {
+      console.error('[GEO] Error al detener monitorización:', e);
+    }
   },
 
   // Helpers para la lógica de "Usuario Responde"

@@ -1,11 +1,10 @@
 import React, { useState, useCallback } from 'react';
 import { View, Text, FlatList, TouchableOpacity, StyleSheet, TextInput } from 'react-native';
-// ✅ FIX 4: Import correcto de SafeAreaView
-import { SafeAreaView } from 'react-native-safe-area-context'; 
+import { SafeAreaView } from 'react-native-safe-area-context';
 import { useFocusEffect } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
 import { useLanguage } from '../../src/context/LanguageContext';
-import { getDB, deleteWorkSession, updateWorkSessionManual, getSettings, checkSessionOverlap } from '../../src/database/db';
+import { getDB, deleteWorkSession, updateWorkSessionManual, getSettings, checkSessionOverlap, insertAuditLog } from '../../src/database/db';
 import { WorkSession } from '../../src/types';
 import { generateWeeklyReport } from '../../src/services/ReportGenerator';
 import { COLORS } from '../../src/constants/theme';
@@ -51,8 +50,11 @@ export default function HistoryScreen() {
     let tMs = 0;
     allSessions.forEach(s => {
       if (s.start_time >= monday.getTime()) {
+        // Use the GPS-confirmed start time when available (actual_start_time),
+        // falling back to the declared start time.
+        const effectiveStart = s.actual_start_time || s.start_time;
         const end = s.end_time || Date.now();
-        let dur = end - s.start_time;
+        let dur = end - effectiveStart;
         if (s.lunch_taken) dur -= 3600000;
         tMs += Math.max(0, dur);
       }
@@ -81,6 +83,7 @@ export default function HistoryScreen() {
       isDestructive: true,
       onConfirm: async () => {
         await deleteWorkSession(id);
+        await insertAuditLog(id, 'DELETE_SESSION', 'Registro eliminado manualmente por usuario.');
         showToast("Registro eliminado", "success");
         loadHistory();
       }
